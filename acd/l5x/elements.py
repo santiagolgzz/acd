@@ -46,6 +46,16 @@ def _escape_xml_attr(value: object) -> str:
     return text.replace("\t", "&#x9;").replace("\r", "&#xD;").replace("\n", "&#xA;")
 
 
+def _cdata_section(text: str) -> str:
+    """Wrap text in a CDATA section, stripping XML-illegal characters.
+
+    A CDATA section cannot contain ``]]>``, so that sequence is split across
+    two sections (``]]]]><![CDATA[>``), which is how Rockwell escapes it.
+    """
+    text = _XML_ILLEGAL_RE.sub("", text).replace("]]>", "]]]]><![CDATA[>")
+    return f"<![CDATA[{text}]]>"
+
+
 # Characters that are illegal in Windows (and some other) filesystem names.
 # comp_name values are Logix tag/channel names and can legally contain
 # ":" (e.g. "CHANNEL_DI_TIMESTAMP:O:0"), "/" and "\" (member access), and
@@ -516,6 +526,178 @@ def _generate_decorated(dt_base: str, dimensions: Union[str, None],
     return f'<Data Format="Decorated">\n{body}\n</Data>'
 
 
+# Stored tag values (a tag data object's attribute 0x66) are the controller's
+# little-endian memory image of the tag. Only the layouts below are decoded;
+# everything else (scalar BOOLs, which live as bits in a hidden host word, UDTs,
+# AOI instances, module-defined types) keeps the zero defaults above.
+_PRIMITIVE_FORMAT: Dict[str, str] = {
+    "SINT": "<b", "INT": "<h", "DINT": "<i", "LINT": "<q",
+    "USINT": "<B", "UINT": "<H", "UDINT": "<I", "ULINT": "<Q",
+    "REAL": "<f", "LREAL": "<d",
+}
+
+# Control-word bit names of built-in structs, from bit 31 down. The DINT after
+# the control word is PRE (LEN for CONTROL) and the next one ACC (POS).
+_BUILTIN_STRUCT_BITS: Dict[str, List[str]] = {
+    "TIMER": ["EN", "TT", "DN"],
+    "COUNTER": ["CU", "CD", "DN", "OV", "UN"],
+    "CONTROL": ["EN", "EU", "DN", "EM", "ER", "UL", "IN", "FD"],
+}
+
+# STRING: LEN (DINT) + DATA (SINT[82]) + 2 pad bytes.
+_STRING_SIZE = 88
+_STRING_DATA_LEN = 82
+
+
+def _element_size(dt_base: str) -> Union[int, None]:
+    fmt = _PRIMITIVE_FORMAT.get(dt_base)
+    if fmt is not None:
+        return struct.calcsize(fmt)
+    if dt_base in _BUILTIN_STRUCT_BITS:
+        return 12
+    if dt_base == "STRING":
+        return _STRING_SIZE
+    return None
+
+
+def _format_number(dt_base: str, raw: bytes, l5k: bool) -> str:
+    value = struct.unpack(_PRIMITIVE_FORMAT[dt_base], raw)[0]
+    if dt_base not in ("REAL", "LREAL"):
+        return str(value)
+    if l5k:
+        # L5K writes floats as 0.00000000e+000 (three exponent digits).
+        mantissa, exponent = f"{value:.8e}".split("e")
+        return f"{mantissa}e{exponent[0]}{int(exponent[1:]):03d}"
+    if dt_base == "REAL":
+        # Shortest text that reads back as the same 32-bit float.
+        for precision in range(1, 10):
+            text = f"{value:.{precision}g}"
+            try:
+                packed = struct.pack("<f", float(text))
+            except OverflowError:
+                # Rounded up past the largest finite REAL; try more digits.
+                continue
+            if packed == raw:
+                break
+    else:
+        text = repr(value)
+    if text.replace("-", "").isdigit():
+        text += ".0"
+    return text
+
+
+def _logix_string(raw: bytes) -> str:
+    """Quote bytes as a Logix ASCII string literal ($ escapes, single quotes)."""
+    out = []
+    for b in raw:
+        ch = chr(b)
+        if ch == "$":
+            out.append("$$")
+        elif ch == "'":
+            out.append("$'")
+        elif 0x20 <= b < 0x7F:
+            out.append(ch)
+        else:
+            out.append(f"${b:02X}")
+    return "'" + "".join(out) + "'"
+
+
+def _struct_value_members_xml(dt_base: str, raw: bytes) -> Union[str, None]:
+    if dt_base == "STRING":
+        length = struct.unpack_from("<i", raw, 0)[0]
+        if not 0 <= length <= _STRING_DATA_LEN:
+            return None
+        text = _logix_string(raw[4 : 4 + length])
+        return (
+            f'<DataValueMember Name="LEN" DataType="DINT" Radix="Decimal" Value="{length}"/>'
+            f'<DataValueMember Name="DATA" DataType="STRING" Radix="ASCII">\n'
+            f'{_cdata_section(text)}\n</DataValueMember>'
+        )
+    control, first, second = struct.unpack_from("<Iii", raw, 0)
+    names = ("LEN", "POS") if dt_base == "CONTROL" else ("PRE", "ACC")
+    parts = [
+        f'<DataValueMember Name="{names[0]}" DataType="DINT" Radix="Decimal" Value="{first}"/>',
+        f'<DataValueMember Name="{names[1]}" DataType="DINT" Radix="Decimal" Value="{second}"/>',
+    ]
+    for bit, name in enumerate(_BUILTIN_STRUCT_BITS[dt_base]):
+        parts.append(
+            f'<DataValueMember Name="{name}" DataType="BOOL" Value="{(control >> (31 - bit)) & 1}"/>'
+        )
+    return "".join(parts)
+
+
+def _l5k_from_data(dt_base: str, data: bytes) -> Union[str, None]:
+    """L5K text for a scalar numeric tag's stored value, or None."""
+    size = _element_size(dt_base)
+    if dt_base not in _PRIMITIVE_FORMAT or size is None or not size <= len(data) < size + 8:
+        return None
+    return _format_number(dt_base, data[:size], l5k=True)
+
+
+def _decorated_from_data(dt_base: str, dimensions: Union[str, None],
+                         data: bytes) -> Union[str, None]:
+    """<Data Format="Decorated"> holding a tag's stored values, or None.
+
+    None means the type is not decoded or the data size does not match the
+    tag's type and dimensions; the caller then falls back to zero defaults.
+    """
+    dim_parts = (
+        [int(d) for d in dimensions.split(",") if d.strip().isdigit()] if dimensions else []
+    )
+    if dimensions and not dim_parts:
+        return None
+    total = 1
+    for d in dim_parts:
+        total *= d
+
+    if dt_base == "BOOL":
+        # BOOL arrays are packed 32 to a DINT.
+        if not dim_parts or len(data) < ((total + 31) // 32) * 4:
+            return None
+        size = 0
+    else:
+        size = _element_size(dt_base)
+        if size is None or not size * total <= len(data) < size * total + 8:
+            return None
+
+    def element_value(i: int) -> str:
+        if dt_base == "BOOL":
+            return str((data[i // 8] >> (i % 8)) & 1)
+        return _format_number(dt_base, data[i * size : (i + 1) * size], l5k=False)
+
+    if not dim_parts:
+        inner = _struct_value_members_xml(dt_base, data[:size])
+        if inner is None:
+            return None
+        body = f'<Structure DataType="{dt_base}">{inner}</Structure>'
+        return f'<Data Format="Decorated">\n{body}\n</Data>'
+
+    elements = []
+    for i in range(total):
+        index, rest = [], i
+        for d in reversed(dim_parts):
+            index.insert(0, rest % d)
+            rest //= d
+        idx = "[" + "][".join(str(p) for p in index) + "]"
+        if dt_base == "BOOL" or dt_base in _PRIMITIVE_FORMAT:
+            elements.append(f'<Element Index="{idx}" Value="{element_value(i)}"/>')
+        else:
+            inner = _struct_value_members_xml(dt_base, data[i * size : (i + 1) * size])
+            if inner is None:
+                return None
+            elements.append(
+                f'<Element Index="{idx}"><Structure DataType="{dt_base}">{inner}</Structure></Element>'
+            )
+    dim_str = ",".join(str(d) for d in dim_parts)
+    if dt_base == "BOOL":
+        attrs = 'DataType="BOOL" Dimensions="%s" Radix="Decimal"' % dim_str
+    elif dt_base in _PRIMITIVE_FORMAT:
+        attrs = f'DataType="{dt_base}" Dimensions="{dim_str}" Radix="{_PRIMITIVE_RADIX[dt_base]}"'
+    else:
+        attrs = f'DataType="{dt_base}" Dimensions="{dim_str}"'
+    return f'<Data Format="Decorated">\n<Array {attrs}>{"".join(elements)}</Array>\n</Data>'
+
+
 @dataclass
 class ProduceInfo(L5xElement):
     produce_count: str
@@ -564,6 +746,8 @@ class Tag(L5xElement):
     alias_for: Union[str, None] = None
     produce_info: Union[ProduceInfo, None] = None
     consume_info: Union[ConsumeInfo, None] = None
+    # Raw stored value from the tag's data object; None when not found.
+    _data: Union[bytes, None] = None
 
     @property
     def _l5x_exclude(self) -> bool:
@@ -614,7 +798,12 @@ class Tag(L5xElement):
         # Everything else (UDTs, arrays, TIMER, COUNTER, etc.) gets Format="Decorated".
         dt_base = self.data_type.split("[")[0].upper() if self.data_type else ""
         l5k_zero = _PRIMITIVE_L5K_ZERO.get(dt_base) if not self.dimensions else None
+        if l5k_zero is not None and self._data and not self.alias_for:
+            l5k_zero = _l5k_from_data(dt_base, self._data) or l5k_zero
         data_xml = f'<Data Format="L5K">\n{l5k_zero}\n</Data>' if l5k_zero is not None else ""
+
+        if not data_xml and self._data and not self.alias_for:
+            data_xml = _decorated_from_data(dt_base, self.dimensions, self._data) or ""
 
         if not data_xml and dt_base not in _SKIP_DECORATED and dt_base != "STRING":
             # Generate Decorated data for non-primitive / array types
@@ -1975,6 +2164,30 @@ class TagBuilder(L5xElementBuilder):
         return resolved
 
     def build(self) -> Tag:
+        tag = self._build()
+        r = self._record
+        if r is not None and not isinstance(r, LegacyRxGeneric):
+            data = self._data_object_value(tag._data_table_instance)
+            if data is not None:
+                tag._data = data
+        return tag
+
+    def _data_object_value(self, object_id: int) -> Union[bytes, None]:
+        """The stored value bytes (attribute 0x66) of a tag's data object."""
+        self._cur.execute("SELECT record FROM comps WHERE object_id=?", (object_id,))
+        row = self._cur.fetchone()
+        if not row:
+            return None
+        try:
+            data_object = RxGeneric.from_bytes(row[0])
+        except Exception:
+            return None
+        return next(
+            (bytes(a.value) for a in data_object.extended_records if a.attribute_id == 0x66),
+            None,
+        )
+
+    def _build(self) -> Tag:
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record FROM comps WHERE object_id="
             + str(self._object_id)
@@ -1992,6 +2205,7 @@ class TagBuilder(L5xElementBuilder):
             external_access = "Read/Write"
             constant = None
 
+        self._record = None
         try:
             r = RxGeneric.from_bytes(raw_rec)
         except Exception:
@@ -2003,6 +2217,7 @@ class TagBuilder(L5xElementBuilder):
             return Tag(
                 results[0][0], results[0][0], "Base", "", None, external_access, constant, None, 0, []
             )
+        self._record = r
 
         scope_key, member_key = (
             (0, 0) if isinstance(r, LegacyRxGeneric) else scoped_comment_keys(raw_rec)

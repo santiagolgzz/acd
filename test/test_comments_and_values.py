@@ -5,7 +5,13 @@ import xml.etree.ElementTree as ET
 from types import SimpleNamespace
 
 from acd.api import ImportProjectFromFile
-from acd.l5x.elements import _USER_COMMENT, scoped_comment_keys
+from acd.l5x.elements import (
+    _decorated_from_data,
+    _l5k_from_data,
+    _logix_string,
+    scoped_comment_keys,
+    _USER_COMMENT,
+)
 from acd.l5x.export_l5x import ExportL5x
 from acd.record.comments import CommentsRecord
 
@@ -110,3 +116,61 @@ def test_type1_internal_string_records_are_left_out_of_descriptions():
     )
     assert cur.fetchall() == [("Made up note",)]
     db.close()
+
+
+def test_l5k_scalar_values():
+    assert _l5k_from_data("DINT", struct.pack("<i", -42)) == "-42"
+    assert _l5k_from_data("INT", struct.pack("<h", 1234) + bytes(2)) == "1234"
+    assert _l5k_from_data("REAL", struct.pack("<f", 90.0)) == "9.00000000e+001"
+    assert _l5k_from_data("BOOL", bytes(4)) is None
+    assert _l5k_from_data("DINT", bytes(2)) is None
+
+
+def test_decorated_timer_value():
+    data = struct.pack("<Iii", 1 << 29, 4000, 1500)
+    xml = _decorated_from_data("TIMER", None, data)
+    assert 'Name="PRE" DataType="DINT" Radix="Decimal" Value="4000"' in xml
+    assert 'Name="ACC" DataType="DINT" Radix="Decimal" Value="1500"' in xml
+    assert 'Name="DN" DataType="BOOL" Value="1"' in xml
+    assert 'Name="EN" DataType="BOOL" Value="0"' in xml
+
+
+def test_decorated_string_value():
+    data = struct.pack("<i", 4) + b"A$'B" + bytes(84 - 4)
+    xml = _decorated_from_data("STRING", None, data)
+    assert 'Value="4"' in xml
+    assert "<![CDATA['A$$$'B']]>" in xml
+
+
+def test_string_value_with_cdata_end_marker():
+    data = struct.pack("<i", 3) + b"]]>" + bytes(84 - 3)
+    xml = _decorated_from_data("STRING", None, data)
+    assert "<![CDATA[']]]]><![CDATA[>']]>" in xml
+
+
+def test_decorated_arrays():
+    xml = _decorated_from_data("REAL", "2", struct.pack("<ff", 1.5, 2.0))
+    assert '<Element Index="[0]" Value="1.5"/>' in xml
+    assert '<Element Index="[1]" Value="2.0"/>' in xml
+    xml = _decorated_from_data("BOOL", "32", struct.pack("<I", 0b101))
+    assert '<Element Index="[0]" Value="1"/>' in xml
+    assert '<Element Index="[1]" Value="0"/>' in xml
+    assert '<Element Index="[2]" Value="1"/>' in xml
+    xml = _decorated_from_data("DINT", "2,2", struct.pack("<4i", 1, 2, 3, 4))
+    assert '<Element Index="[1][0]" Value="3"/>' in xml
+
+
+
+def test_largest_real_value():
+    # Rounding the largest finite REAL to 4 digits overflows a 32-bit float.
+    raw = struct.pack("<I", 0x7F7FFFFF)
+    xml = _decorated_from_data("REAL", "1", raw)
+    assert '<Element Index="[0]" Value="3.4028235e+38"/>' in xml
+
+def test_decorated_size_mismatch_falls_back():
+    assert _decorated_from_data("DINT", "4", bytes(8)) is None
+    assert _decorated_from_data("MY_UDT", None, bytes(8)) is None
+
+
+def test_logix_string_escapes():
+    assert _logix_string(b"a\r\n") == "'a$0D$0A'"
