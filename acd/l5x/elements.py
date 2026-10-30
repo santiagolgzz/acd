@@ -1975,10 +1975,21 @@ class TagBuilder(L5xElementBuilder):
                 results[0][0], results[0][0], "Base", "", None, external_access, constant, None, 0, []
             )
 
-        self._cur.execute(
-            "SELECT tag_reference, record_string FROM comments WHERE parent="
-            + str((r.comment_id * 0x10000) + r.cip_type)
+        scope_key, member_key = (
+            (0, 0) if isinstance(r, LegacyRxGeneric) else scoped_comment_keys(raw_rec)
         )
+        if member_key:
+            # Program tag: only the comments filed under this tag's own key,
+            # not every comment in the program's scope.
+            self._cur.execute(
+                "SELECT tag_reference, record_string FROM comments WHERE parent=? AND member_ref=?",
+                (scope_key, member_key),
+            )
+        else:
+            self._cur.execute(
+                "SELECT tag_reference, record_string FROM comments WHERE parent="
+                + str((r.comment_id * 0x10000) + r.cip_type)
+            )
         comment_results = self._cur.fetchall()
 
         extended_records: Dict[int, bytes] = {}
@@ -2310,6 +2321,23 @@ def routine_type_enum(idx: int) -> str:
     return "Typeless"
 
 
+def scoped_comment_keys(raw: bytes) -> Tuple[int, int]:
+    """Return (scope key, member key) for a Comps record.
+
+    Objects owned by a program (routines, program tags) carry the program's
+    comment key (cip_type, comment_id) at 0x0A and their own at 0x0E.
+    RxGeneric reads only the first, so every routine and tag in a program
+    resolves to the same key. Their comments are stored with
+    parent = scope key and member_ref = own key. The member key is 0 for
+    objects that have no owning scope (e.g. controller tags).
+    """
+    if len(raw) < 0x12:
+        return 0, 0
+    scope_cip, scope_cid, own_cip, own_cid = struct.unpack_from("<HHHH", raw, 0x0A)
+    member_key = (own_cid * 0x10000) + own_cip if own_cip else 0
+    return (scope_cid * 0x10000) + scope_cip, member_key
+
+
 @dataclass
 class RoutineBuilder(L5xElementBuilder):
     def build(self) -> Routine:
@@ -2361,24 +2389,49 @@ class RoutineBuilder(L5xElementBuilder):
                     )
                 rungs = [_resolve(r) if r else r for r in rungs]
 
-        # Fetch rung-level comments from the comments table.
-        # Rung comments are stored under the routine's own comment parent key
-        # (comment_id * 0x10000 + cip_type), as AsciiRecord (record_type=1) entries
-        # where rung_content != 0 (distinguishes user rung comments from internal
-        # metadata strings like FBDRoutineDescription which have rung_content=0).
-        # The object_id field is the 1-based rung index (rung 0 -> object_id=1).
+        # Fetch rung-level comments from the comments table, as AsciiRecord
+        # (record_type=1) entries where rung_content != 0 (distinguishes user rung
+        # comments from internal metadata strings like FBDRoutineDescription which
+        # have rung_content=0).
         rung_comments: Dict[int, str] = {}
         try:
-            comment_parent = (r.comment_id * 0x10000) + r.cip_type
-            self._cur.execute(
-                "SELECT object_id, record_string FROM comments "
-                "WHERE parent=? AND record_type=1 AND rung_content!=0",
-                (comment_parent,),
+            scope_key, member_key = (
+                (0, 0) if isinstance(r, LegacyRxGeneric) else scoped_comment_keys(record)
             )
-            for obj_id, rec_str in self._cur.fetchall():
-                rung_index = obj_id - 1  # convert 1-based to 0-based
-                if rung_index >= 0 and rec_str and rung_index not in rung_comments:
-                    rung_comments[rung_index] = rec_str
+            if member_key:
+                # Rung comments sit in the program's comment scope with
+                # member_ref = the routine's own key, and the high half of
+                # rung_content is the rung uid from RegnLink.Dat.
+                position = {oid: i for i, oid in enumerate(rung_ids)}
+                self._cur.execute(
+                    "SELECT object_id, uid FROM rung_uids WHERE parent_id=?",
+                    (self._object_id,),
+                )
+                index_by_uid = {
+                    uid: position[oid] for oid, uid in self._cur.fetchall() if oid in position
+                }
+                self._cur.execute(
+                    "SELECT rung_content, record_string FROM comments "
+                    "WHERE parent=? AND member_ref=? AND record_type=1 AND rung_content!=0",
+                    (scope_key, member_key),
+                )
+                for rung_content, rec_str in self._cur.fetchall():
+                    rung_index = index_by_uid.get(rung_content >> 16)
+                    if rung_index is not None and rec_str and rung_index not in rung_comments:
+                        rung_comments[rung_index] = rec_str
+            else:
+                # Older layout: comments under the routine's own key, with
+                # object_id as the 1-based rung index (rung 0 -> object_id=1).
+                comment_parent = (r.comment_id * 0x10000) + r.cip_type
+                self._cur.execute(
+                    "SELECT object_id, record_string FROM comments "
+                    "WHERE parent=? AND record_type=1 AND rung_content!=0",
+                    (comment_parent,),
+                )
+                for obj_id, rec_str in self._cur.fetchall():
+                    rung_index = obj_id - 1  # convert 1-based to 0-based
+                    if rung_index >= 0 and rec_str and rung_index not in rung_comments:
+                        rung_comments[rung_index] = rec_str
         except Exception:
             pass
 
