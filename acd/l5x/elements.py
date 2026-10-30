@@ -3491,6 +3491,11 @@ class AoiBuilder(L5xElementBuilder):
         )
 
 
+# Comps record type of tags Logix creates itself (__l<hash>, __SHADOW_<id>,
+# __DEFVAL_<id>, __CONTAINER); user tags are record type 256.
+_SYSTEM_TAG_RECORD_TYPE = 264
+
+
 @dataclass
 class ProgramBuilder(L5xElementBuilder):
     _data_types_map: Dict[str, "DataType"] = field(default_factory=dict)
@@ -3570,9 +3575,23 @@ class ProgramBuilder(L5xElementBuilder):
             + str(tag_collection_id)
         )
         results = self._cur.fetchall()
+        # A program output parameter is stored twice: the tag itself, renamed
+        # __INTERNAL_<name>, and a "__SHADOW_<its object id>" record that
+        # carries the public name. Rockwell exports only the shadow.
+        shadowed = {
+            int(row[0][len("__SHADOW_"):], 16)
+            for row in results
+            if re.fullmatch(r"__SHADOW_[0-9A-Fa-f]{8}", row[0])
+        }
         tags: List[Tag] = []
         for result in results:
+            if result[1] in shadowed:
+                continue
             tag = TagBuilder(self._cur, result[1]).build()
+            if result[3] == _SYSTEM_TAG_RECORD_TYPE and tag.name == result[0]:
+                # A system-created tag (e.g. __l<hash>) under its own system
+                # name; only shadows (which carry a user name) are exported.
+                continue
             tag._data_types_map = self._data_types_map
             tag._value_types_map = self._value_types_map
             tags.append(tag)
