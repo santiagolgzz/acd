@@ -95,14 +95,33 @@ class LegacyRxGeneric:
         return metadata[2 : 2 + length].decode("utf-8", errors="replace")
 
 
+@dataclass
+class RxAttribute:
+    attribute_id: int
+    len_value: int
+    value: bytes
+
+
 class RxGeneric:
+    @staticmethod
+    def _read_last_attribute(parsed, raw: bytes):
+        # The generated parser reads count_record - 1 attributes, which drops
+        # the final one; read it from the bytes that follow, when present.
+        pos = 82 + sum(8 + len(bytes(item.value)) for item in parsed.extended_records)
+        if len(parsed.extended_records) < parsed.count_record and pos + 8 <= len(raw):
+            attribute_id, length = struct.unpack_from("<II", raw, pos)
+            value = raw[pos + 8 : pos + 8 + length]
+            if len(value) == length:
+                parsed.extended_records.append(RxAttribute(attribute_id, length, value))
+        return parsed
+
     @staticmethod
     def from_bytes(raw: bytes):
         raw = bytes(raw)
         # The stored length excludes the last four bytes of the final
         # attribute, which CompsRecord.parse keeps.
         if len(raw) >= 82 and struct.unpack_from("<I", raw, 74)[0] in (len(raw) - 74, len(raw) - 78):
-            return GeneratedRxGeneric.from_bytes(raw)
+            return RxGeneric._read_last_attribute(GeneratedRxGeneric.from_bytes(raw), raw)
         if len(raw) >= 32 and struct.unpack_from("<I", raw, 24)[0] in (
             len(raw) - 28,
             len(raw) - 24,

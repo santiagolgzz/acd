@@ -499,3 +499,14 @@ def test_protected_routine_keeps_its_type():
         assert "could not be read" in conversion_notes.current()[-1]
     finally:
         database.close()
+
+
+def test_rx_reads_final_attribute():
+    attributes = struct.pack("<II", 0x65, 4) + b"\x01\x02\x03\x04" + struct.pack("<II", 0x01, 3) + b"abc"
+    head = struct.pack("<IIHHH", 0, 0, 0, 0x68, 0) + bytes(60)
+    raw = head + struct.pack("<II", len(attributes) + 8, 2) + attributes
+    parsed = RxGeneric.from_bytes(raw)
+    assert [(item.attribute_id, bytes(item.value)) for item in parsed.extended_records] == [
+        (0x65, b"\x01\x02\x03\x04"),
+        (0x01, b"abc"),
+    ]
