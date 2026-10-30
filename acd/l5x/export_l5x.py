@@ -80,6 +80,10 @@ class ExportL5x:
         self._cur.execute(
             "CREATE TABLE region_map(object_id int, parent_id int, unknown int, seq_no int, record BLOB NOT NULL)"
         )
+        log.debug("Create Rung_uids table in sqllite db")
+        self._cur.execute(
+            "CREATE TABLE rung_uids(object_id int, parent_id int, uid int)"
+        )
         log.debug("Create Comments table in sqllite db")
         self._cur.execute(
             "CREATE TABLE comments(seq_number int, sub_record_length int, object_id int, record_string text, record_type int, parent int, tag_reference text, rung_content int, member_ref int)"
@@ -155,6 +159,7 @@ class ExportL5x:
         # both exist, try to recover any Region Map entry that was truncated
         # before its object_id (see populate_region_map/_parse_region_map).
         self._repair_region_map_gaps()
+        self.populate_rung_uids()
 
         log.info(
             "Getting records from ACD Comments file and storing in sqllite database"
@@ -178,6 +183,7 @@ class ExportL5x:
         self._cur.execute("CREATE INDEX idx_comps_parent_name ON comps(parent_id, comp_name)")
         self._cur.execute("CREATE INDEX idx_rungs_object_id ON rungs(object_id)")
         self._cur.execute("CREATE INDEX idx_region_map_parent_id ON region_map(parent_id)")
+        self._cur.execute("CREATE INDEX idx_rung_uids_parent_id ON rung_uids(parent_id)")
         self._cur.execute("CREATE INDEX idx_comments_parent ON comments(parent)")
         self._db.commit()
 
@@ -551,6 +557,39 @@ class ExportL5x:
                 )
 
         return entries
+
+    def populate_rung_uids(self):
+        path = os.path.join(self._temp_dir, "RegnLink.Dat")
+        if not os.path.exists(path):
+            return
+        with open(path, "rb") as f:
+            data = f.read()
+        self._cur.execute("SELECT object_id, parent_id FROM region_map")
+        self._cur.executemany(
+            "INSERT INTO rung_uids VALUES (?, ?, ?)",
+            self._parse_rung_uids(data, self._cur.fetchall()),
+        )
+        self._db.commit()
+
+    @staticmethod
+    def _parse_rung_uids(data: bytes, rungs):
+        # RegnLink.Dat holds one 22-byte link record per rung:
+        #   u8[6] flags, u16 rung uid, u16 unknown, u32 routine object_id,
+        #   u32 rung object_id, u32 next object_id
+        # Rung comments in Comments.Dat are keyed by that uid (the high half of
+        # the comment's rung_content), not by rung position. The file's page
+        # layout is not decoded, so records are located by the
+        # (routine, rung) object_id pair, which the region map already gives.
+        # The routine's own head record (flags 00 00 00 ..., uid 0xFFFF) also
+        # contains a (routine, first rung) pair, so require the third flag
+        # byte to be 0x02 as it is on every rung link record.
+        wanted = {struct.pack("<II", parent, rung): (rung, parent) for rung, parent in rungs}
+        found = {}
+        for i in range(10, len(data) - 7):
+            key = data[i : i + 8]
+            if key in wanted and data[i - 8] == 0x02 and wanted[key] not in found:
+                found[wanted[key]] = struct.unpack_from("<H", data, i - 4)[0]
+        return [(rung, parent, uid) for (rung, parent), uid in found.items()]
 
 
 if __name__ == "__main__":
