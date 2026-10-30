@@ -88,6 +88,8 @@ class ExportL5x:
         self._cur.execute("CREATE TABLE comment_keys(object_id int, scope_key int, member_key int)")
         log.debug("Create Tag_data table in sqllite db")
         self._cur.execute("CREATE TABLE tag_data(object_id int, data BLOB NOT NULL)")
+        log.debug("Create Alias_paths table in sqllite db")
+        self._cur.execute("CREATE TABLE alias_paths(object_id int, path BLOB NOT NULL)")
         log.debug("Create Rung_uids table in sqllite db")
         self._cur.execute(
             "CREATE TABLE rung_uids(object_id int, parent_id int, uid int)"
@@ -127,6 +129,7 @@ class ExportL5x:
         comps_by_id = {}
         data_by_id = {}
         keys_by_id = {}
+        alias_by_id = {}
         # Projects saved by v20 and earlier use the legacy Comps layout (see
         # CompsRecord.parse); their Comments.Dat uses a legacy layout too.
         legacy_records = sum(
@@ -150,6 +153,7 @@ class ExportL5x:
                     comps_by_id[oid] = t
                     data_by_id[oid] = CompsRecord.data_value(record)
                     keys_by_id[oid] = CompsRecord.legacy_comment_keys(record)
+                    alias_by_id[oid] = CompsRecord.alias_path(record)
         self._cur.executemany("INSERT INTO comps VALUES (?,?,?,?,?,?)", comps_by_id.values())
         self._cur.executemany(
             "INSERT INTO comment_keys VALUES (?,?,?)",
@@ -158,6 +162,10 @@ class ExportL5x:
         self._cur.executemany(
             "INSERT INTO tag_data VALUES (?,?)",
             [(oid, data) for oid, data in data_by_id.items() if data is not None],
+        )
+        self._cur.executemany(
+            "INSERT INTO alias_paths VALUES (?,?)",
+            [(oid, path) for oid, path in alias_by_id.items() if path is not None],
         )
         self._db.commit()
 
@@ -216,6 +224,7 @@ class ExportL5x:
         self._cur.execute("CREATE INDEX idx_region_map_parent_id ON region_map(parent_id)")
         self._cur.execute("CREATE INDEX idx_rung_uids_parent_id ON rung_uids(parent_id)")
         self._cur.execute("CREATE INDEX idx_tag_data_object_id ON tag_data(object_id)")
+        self._cur.execute("CREATE INDEX idx_alias_paths_object_id ON alias_paths(object_id)")
         self._cur.execute("CREATE INDEX idx_comment_keys_object_id ON comment_keys(object_id)")
         self._cur.execute("CREATE INDEX idx_comments_parent ON comments(parent)")
         self._db.commit()

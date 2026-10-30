@@ -79,9 +79,35 @@ class CompsRecord:
             # Rx layout: 74-byte header and main record, then len_record and
             # count_record, then (u32 attribute_id, u32 length, value) entries.
             payload, pos = raw[148:], 82
+        return CompsRecord._attribute(payload, pos, 0x66)
+
+    @staticmethod
+    def alias_path(dat_record: DatRecord) -> Optional[bytes]:
+        """Return the alias path (Rx attribute 0x65) of a current-layout tag.
+
+        Alias tags keep their target as a utf-16 path of object IDs, the same
+        form legacy files use (e.g. "@<tag id>@.@<member id>@.13"). It is the
+        tag record's last attribute and runs past the declared length that
+        parse() truncates at, so it is read from the physical record. Legacy
+        records keep it intact in parse() already and return None here.
+        """
+        if dat_record.identifier != 64250:
+            return None
+        raw = bytes(dat_record.record.record_buffer)
+        if len(raw) < 158 or struct.unpack_from("<I", raw, 0x0C)[0] != 0:
+            return None
+        payload = raw[148:]
+        if struct.unpack_from("<H", payload, 10)[0] not in (0x68, 0x6B):
+            return None
+        return CompsRecord._attribute(payload, 82, 0x65)
+
+    @staticmethod
+    def _attribute(payload: bytes, pos: int, wanted: int) -> Optional[bytes]:
+        """Value of attribute `wanted` in the (u32 id, u32 length, value)
+        list starting at `pos`; None when absent or cut short."""
         while pos + 8 <= len(payload):
             attribute_id, length = struct.unpack_from("<II", payload, pos)
-            if attribute_id == 0x66:
+            if attribute_id == wanted:
                 value = payload[pos + 8 : pos + 8 + length]
                 return value if len(value) == length else None
             pos += 8 + length

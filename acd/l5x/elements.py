@@ -2298,7 +2298,7 @@ class TagBuilder(L5xElementBuilder):
         # terminator at all. The length just needs to be a whole number of
         # utf-16 code units; a missing terminator isn't itself invalid.
         if len(value) % 2:
-            raise ValueError("Invalid legacy alias path")
+            raise ValueError("Invalid alias path")
         path = value.decode("utf-16-le").rstrip("\x00")
 
         def replace_object_id(match):
@@ -2309,7 +2309,7 @@ class TagBuilder(L5xElementBuilder):
             )
             row = self._cur.fetchone()
             if not row:
-                raise ValueError("Legacy alias target does not exist")
+                raise ValueError("Alias target does not exist")
             try:
                 target = RxGeneric.from_bytes(row[1])
                 logical_name = getattr(target, "logical_name", "")
@@ -2317,12 +2317,49 @@ class TagBuilder(L5xElementBuilder):
                     return logical_name
             except Exception:
                 pass
-            return row[0]
+            return self._module_tag_name(row[0])
 
         resolved = re.sub(r"@([0-9a-fA-F]{8})@", replace_object_id, path)
         if re.search(r"@[0-9a-fA-F]{8}@", resolved):
-            raise ValueError("Legacy alias target could not be resolved")
+            raise ValueError("Alias target could not be resolved")
         return resolved
+
+    def _module_tag_name(self, comp_name: str) -> str:
+        # Current-layout module tags are named "&<module object id>:2:O";
+        # Rockwell writes the module's name there ("Local:2:O").
+        match = re.match(r"&([0-9a-fA-F]{8}):", comp_name)
+        if not match:
+            return comp_name
+        self._cur.execute(
+            "SELECT comp_name FROM comps WHERE object_id=?",
+            (int(match.group(1), 16),),
+        )
+        row = self._cur.fetchone()
+        if not row:
+            raise ValueError("Alias target module does not exist")
+        return row[0] + comp_name[match.end() - 1 :]
+
+    def _current_alias_for(self, name: str) -> Union[str, None]:
+        # Current-layout alias tags keep the same @<object id>@ path as legacy
+        # ones (attribute 0x65), read from the physical record at load time
+        # into alias_paths since parse() cuts the record's last attribute.
+        try:
+            self._cur.execute(
+                "SELECT path FROM alias_paths WHERE object_id=?", (self._object_id,)
+            )
+            row = self._cur.fetchone()
+        except Exception:
+            return None
+        if not row:
+            return None
+        try:
+            return self._legacy_alias_for(bytes(row[0]))
+        except ValueError as e:
+            log.warning(
+                f"Tag '{name}': couldn't resolve its alias target ({e}) -- "
+                "exporting it as a Base tag instead"
+            )
+            return None
 
     def build(self) -> Tag:
         tag = self._build()
@@ -2499,6 +2536,28 @@ class TagBuilder(L5xElementBuilder):
             )
             data_type_results = self._cur.fetchall()
             data_type = data_type_results[0][0] if data_type_results else ""
+
+        alias_name = results[0][0]
+        if len(extended_records.get(0x01, b"")) >= 2:
+            name_length = struct.unpack("<H", extended_records[0x01][0:2])[0]
+            alias_name = bytes(extended_records[0x01][2 : name_length + 2]).decode(
+                "utf-8", errors="replace"
+            )
+        alias_for = self._current_alias_for(alias_name)
+        if alias_for:
+            return Tag(
+                alias_name,
+                alias_name,
+                "Alias",
+                None,
+                radix_enum(r.main_record.radix),
+                external_access,
+                None,
+                None,
+                r.main_record.data_table_instance,
+                comment_results,
+                alias_for=alias_for,
+            )
 
         if 0x01 not in extended_records:
             # Name comes from comp_name in the database; radix from main_record
