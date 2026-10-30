@@ -106,7 +106,9 @@ class RxGeneric:
     @staticmethod
     def from_bytes(raw: bytes):
         raw = bytes(raw)
-        if len(raw) >= 82 and struct.unpack_from("<I", raw, 74)[0] == len(raw) - 74:
+        # The stored length excludes the last four bytes of the final
+        # attribute, which CompsRecord.parse keeps.
+        if len(raw) >= 82 and struct.unpack_from("<I", raw, 74)[0] in (len(raw) - 74, len(raw) - 78):
             return GeneratedRxGeneric.from_bytes(raw)
         if len(raw) >= 32 and struct.unpack_from("<I", raw, 24)[0] in (
             len(raw) - 28,

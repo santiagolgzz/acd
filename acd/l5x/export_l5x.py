@@ -404,8 +404,9 @@ class ExportL5x:
         # preceding the entries in their stored length.
         if (
             len(record) >= 78
+            # CompsRecord.parse keeps the four bytes past the stored length.
             and struct.unpack_from("<I", record, 0x4A)[0]
-            == len(record) - 0x4A
+            in (len(record) - 0x4A, len(record) - 0x4E)
         ):
             identifier_offset = 0x4E
             entries_length = struct.unpack_from("<I", record, 0x4A)[0] - 4
