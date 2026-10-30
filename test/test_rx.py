@@ -3,6 +3,7 @@ import struct
 
 import pytest
 
+from acd.l5x import conversion_notes
 from acd.l5x.elements import RoutineBuilder, TagBuilder, TaskBuilder, _program_schedule_id
 from acd.record.rx import LegacyRxGeneric, RxGeneric
 
@@ -495,5 +496,6 @@ def test_protected_routine_keeps_its_type():
         _insert(cursor, 100, "Logic", record)
         routine = RoutineBuilder(cursor, 100).build()
         assert (routine.type, routine.rungs) == ("RLL", [])
+        assert "could not be read" in conversion_notes.current()[-1]
     finally:
         database.close()

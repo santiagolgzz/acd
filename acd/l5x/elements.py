@@ -2788,6 +2788,18 @@ def _legacy_comment_keys(cur: Cursor, object_id: int) -> Tuple[int, int]:
     return (row[0], row[1]) if row else (0, 0)
 
 
+def _routine_owner_name(cur: Cursor, collection_id: int) -> str:
+    # A routine's parent is its routine collection, whose parent is the
+    # owning program or Add-On Instruction.
+    cur.execute(
+        "SELECT o.comp_name FROM comps c JOIN comps o ON o.object_id = c.parent_id "
+        "WHERE c.object_id=?",
+        (collection_id,),
+    )
+    row = cur.fetchone()
+    return row[0] if row else ""
+
+
 @dataclass
 class RoutineBuilder(L5xElementBuilder):
     def build(self) -> Routine:
@@ -2809,6 +2821,11 @@ class RoutineBuilder(L5xElementBuilder):
                 routine_type_enum(struct.unpack_from("<H", raw, 14 + 0x30)[0])
                 if len(raw) >= 74
                 else ""
+            )
+            owner = _routine_owner_name(self._cur, results[0][2])
+            conversion_notes.add(
+                f"Routine '{owner + '/' if owner else ''}{results[0][0]}': content "
+                "could not be read (likely source-protected); exported with no rungs"
             )
             return Routine(results[0][0], results[0][0], routine_type, [])
 
