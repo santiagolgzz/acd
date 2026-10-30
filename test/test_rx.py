@@ -485,12 +485,12 @@ def test_legacy_task_ignores_excess_program_count():
 
 
 def test_protected_routine_keeps_its_type():
-    # 14-byte header, 60-byte main record (type 1 = RLL at 0x30), then an
-    # extended-attribute area whose lengths are unreadable (encrypted).
+    # 14-byte header, 60-byte main record (type 1 = RLL at 0x30), then the
+    # encrypted envelope in place of the attributes.
     main = bytearray(60)
     struct.pack_into("<H", main, 0x30, 1)
     header = struct.pack("<IIHHH", 0, 0, 0, 0x6D, 0)
-    record = header + bytes(main) + struct.pack("<II", 999, 2) + struct.pack("<II", 0x01, 0x55555555)
+    record = header + bytes(main) + struct.pack("<II", 999, 0x0AAA96AA) + bytes(16)
     database, cursor = _database()
     try:
         _insert(cursor, 100, "Logic", record)

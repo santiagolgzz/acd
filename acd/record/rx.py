@@ -1,8 +1,15 @@
 import struct
 from dataclasses import dataclass
-from typing import List
+from typing import Dict, List, Optional
 
 from acd.generated.comps.rx_generic import RxGeneric as GeneratedRxGeneric
+
+# Source protection stores a record's attribute block as an encrypted
+# envelope. The envelope starts with this u32 where a plain record has its
+# attribute count (offset 78, right after the 60-byte main record and the
+# length field); the main record before it stays readable. Nameless records
+# carry the same envelope after their 24-byte header.
+ENCRYPTED_ENVELOPE_MAGIC = 0x0AAA96AA
 
 
 @dataclass
@@ -41,7 +48,28 @@ class LegacyMainRecord:
             self.external_access = struct.unpack_from("<H", metadata, 0x21E)[0]
 
 
-class LegacyRxGeneric:
+class _RxAttributes:
+    """Attribute lookups shared by both Rx layouts."""
+
+    extended_records: list
+    # True for a source-protected record: only the header and main record
+    # are readable, and extended_records is empty.
+    protected = False
+
+    @property
+    def attributes(self) -> Dict[int, bytes]:
+        """Every attribute's value by id (the last one wins on a repeat)."""
+        return {item.attribute_id: bytes(item.value) for item in self.extended_records}
+
+    def attribute(self, attribute_id: int) -> Optional[bytes]:
+        """The first value of attribute `attribute_id`, or None when absent."""
+        return next(
+            (bytes(item.value) for item in self.extended_records if item.attribute_id == attribute_id),
+            None,
+        )
+
+
+class LegacyRxGeneric(_RxAttributes):
     def __init__(self, raw: bytes):
         self.is_legacy = True
         self.data_instance_id, self.unique_tag_identifier = struct.unpack_from(
@@ -52,6 +80,8 @@ class LegacyRxGeneric:
         self.parent_id = self.data_instance_id
         self.record_format_version = 0
         self.cip_type, self.comment_id = struct.unpack_from("<HH", raw, 8)
+        # A routine's type follows its cip_type.
+        self.routine_type = struct.unpack_from("<H", raw, 0x0C)[0]
         self.object_id = struct.unpack_from("<I", raw, 20)[0]
         self.record_buffer = raw[14:74]
         self.len_record, self.count_record = struct.unpack_from("<II", raw, 24)
@@ -78,15 +108,13 @@ class LegacyRxGeneric:
         self.main_record = LegacyMainRecord(raw[12:24], self.extended_records)
 
     @property
+    def data_object_id(self) -> int:
+        """Object id of the tag's data object."""
+        return self.data_instance_id
+
+    @property
     def logical_name(self):
-        metadata = next(
-            (
-                attribute.value
-                for attribute in self.extended_records
-                if attribute.attribute_id == 0x01
-            ),
-            b"",
-        )
+        metadata = self.attribute(0x01) or b""
         if len(metadata) < 2:
             return ""
         length = struct.unpack_from("<H", metadata, 0)[0]
@@ -95,36 +123,51 @@ class LegacyRxGeneric:
         return metadata[2 : 2 + length].decode("utf-8", errors="replace")
 
 
-@dataclass
-class RxAttribute:
-    attribute_id: int
-    len_value: int
-    value: bytes
+class CurrentRxGeneric(GeneratedRxGeneric, _RxAttributes):
+    """The current-layout Rx record, read by the generated parser."""
+
+    @property
+    def data_object_id(self) -> int:
+        """Object id of the tag's data object."""
+        return self.main_record.data_table_instance
+
+    @property
+    def routine_type(self) -> int:
+        """A routine's type index, at 0x30 of the main record."""
+        return struct.unpack_from("<H", self.record_buffer, 0x30)[0]
 
 
 class RxGeneric:
     @staticmethod
-    def _read_last_attribute(parsed, raw: bytes):
-        # The generated parser reads count_record - 1 attributes, which drops
-        # the final one; read it from the bytes that follow, when present.
-        pos = 82 + sum(8 + len(bytes(item.value)) for item in parsed.extended_records)
-        if len(parsed.extended_records) < parsed.count_record and pos + 8 <= len(raw):
-            attribute_id, length = struct.unpack_from("<II", raw, pos)
-            value = raw[pos + 8 : pos + 8 + length]
-            if len(value) == length:
-                parsed.extended_records.append(RxAttribute(attribute_id, length, value))
-        return parsed
+    def _current(raw: bytes) -> CurrentRxGeneric:
+        try:
+            return CurrentRxGeneric.from_bytes(raw)
+        except EOFError:
+            # The final attribute is cut short (the record lacks the four
+            # bytes past its stored length): read the ones before it.
+            count = struct.unpack_from("<I", raw, 78)[0]
+            parsed = CurrentRxGeneric.from_bytes(raw[:78] + struct.pack("<I", max(count - 1, 0)) + raw[82:])
+            parsed.count_record = count
+            return parsed
 
     @staticmethod
     def from_bytes(raw: bytes):
         raw = bytes(raw)
-        # The stored length excludes the last four bytes of the final
-        # attribute, which CompsRecord.parse keeps.
-        if len(raw) >= 82 and struct.unpack_from("<I", raw, 74)[0] in (len(raw) - 74, len(raw) - 78):
-            return RxGeneric._read_last_attribute(GeneratedRxGeneric.from_bytes(raw), raw)
+        if len(raw) >= 82:
+            stored_length, count = struct.unpack_from("<II", raw, 74)
+            if count == ENCRYPTED_ENVELOPE_MAGIC:
+                # Read the header and main record only (as a record with no
+                # attributes); the attributes are encrypted.
+                parsed = CurrentRxGeneric.from_bytes(raw[:78] + bytes(4))
+                parsed.protected = True
+                return parsed
+            # The stored length excludes the last four bytes of the final
+            # attribute, which CompsRecord.parse keeps.
+            if stored_length in (len(raw) - 74, len(raw) - 78):
+                return RxGeneric._current(raw)
         if len(raw) >= 32 and struct.unpack_from("<I", raw, 24)[0] in (
             len(raw) - 28,
             len(raw) - 24,
         ):
             return LegacyRxGeneric(raw)
-        return GeneratedRxGeneric.from_bytes(raw)
+        return RxGeneric._current(raw)

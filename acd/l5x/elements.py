@@ -1754,10 +1754,6 @@ class MemberBuilder(L5xElementBuilder):
         except Exception as e:
             return Member(name, name, "", 0, "Decimal", False, None, None, "Read/Write")
 
-        extended_records: Dict[int, List[int]] = {}
-        for extended_record in r.extended_records:
-            extended_records[extended_record.attribute_id] = extended_record.value
-
         cip_data_typoe = struct.unpack_from("<I", self.record, 0x78)[0]
         dimension = struct.unpack_from("<I", self.record, 0x5C)[0]
         radix = radix_enum(struct.unpack_from("<I", self.record, 0x54)[0])
@@ -1841,6 +1837,12 @@ class MemberBuilder(L5xElementBuilder):
         )
 
 
+def _u32(attributes: Dict[int, bytes], key: int, default: int = 0) -> int:
+    """Attribute `key` read as a u32, or `default` when absent or not 4 bytes."""
+    value = attributes.get(key, b"")
+    return struct.unpack("<I", value)[0] if len(value) == 4 else default
+
+
 @dataclass
 class DataTypeBuilder(L5xElementBuilder):
     def build(self) -> DataType:
@@ -1857,48 +1859,21 @@ class DataTypeBuilder(L5xElementBuilder):
         except Exception as e:
             return DataType(name, name, "NoFamily", "User", [])
 
-        extended_records: Dict[int, bytes] = {}
-        for extended_record in r.extended_records:
-            extended_records[extended_record.attribute_id] = bytes(
-                extended_record.value
-            )
-
-        # Not every UDT's extended-record set carries all three of these --
-        # observed missing on real project files for plain user-defined types
-        # with no string/module-defined role. Default to the "plain UDT"
-        # reading (NoFamily / not built-in / not module-defined) instead of
-        # raising, matching the 0x64 (member_count) handling just below.
-        if 0x6C in extended_records and len(extended_records[0x6C]) == 0x04:
-            string_family_int = struct.unpack("<I", extended_records[0x6C])[0]
-        else:
-            string_family_int = 0
-        string_family = "StringFamily" if string_family_int == 1 else "NoFamily"
-
-        if 0x67 in extended_records and len(extended_records[0x67]) == 0x04:
-            built_in = struct.unpack("<I", extended_records[0x67])[0]
-        else:
-            built_in = 0
-        if 0x69 in extended_records and len(extended_records[0x69]) == 0x04:
-            module_defined = struct.unpack("<I", extended_records[0x69])[0]
-        else:
-            module_defined = 0
+        extended_records = r.attributes
+        # Plain user-defined types can lack any of these attributes.
+        string_family = "StringFamily" if _u32(extended_records, 0x6C) == 1 else "NoFamily"
+        built_in = _u32(extended_records, 0x67)
+        module_defined = _u32(extended_records, 0x69)
 
         class_type = "User"
         if module_defined > 0:
             class_type = "IO"
         if built_in & 0x03:
             class_type = "ProductDefined"
-        if 0x64 in extended_records and len(extended_records[0x64]) == 0x04:
-            member_count = struct.unpack("<I", extended_records[0x64])[0]
-        else:
-            member_count = 0
+        member_count = _u32(extended_records, 0x64)
+        size = _u32(extended_records, 0x65)
 
         if isinstance(r, LegacyRxGeneric):
-            size = (
-                struct.unpack("<I", extended_records[0x65])[0]
-                if len(extended_records.get(0x65, b"")) == 4
-                else 0
-            )
             return DataType(
                 name, name, string_family, class_type,
                 self._legacy_members(extended_records, member_count),
@@ -1972,11 +1947,6 @@ class DataTypeBuilder(L5xElementBuilder):
         if desc_row and desc_row[0]:
             description = desc_row[0]
 
-        size = (
-            struct.unpack("<I", extended_records[0x65])[0]
-            if len(extended_records.get(0x65, b"")) == 4
-            else 0
-        )
         return DataType(name, name, string_family, class_type, children, description, _size=size)
 
     def _legacy_members(self, extended_records: Dict[int, bytes], member_count: int) -> List[Member]:
@@ -2194,7 +2164,7 @@ class ModuleBuilder(L5xElementBuilder):
         if r.cip_type != 0x69:
             return Module(name, name, "", 0, 0, 0, 0, 0, "Local", 1, "false", "false")
 
-        exts: Dict[int, bytes] = {er.attribute_id: bytes(er.value) for er in r.extended_records}
+        exts = r.attributes
         e1 = exts.get(0x001, b"")
         if len(e1) < 0x30:
             major_fault = "true" if name == "Local" else "false"
@@ -2374,10 +2344,7 @@ class TagBuilder(L5xElementBuilder):
                 continue
             if parsed.cip_type != 0x7E:
                 continue
-            attributes = {
-                item.attribute_id: bytes(item.value)
-                for item in parsed.extended_records
-            }
+            attributes = parsed.attributes
             reference = attributes.get(attribute_id, b"")
             data = attributes.get(0x01, b"")
             if (
@@ -2404,10 +2371,7 @@ class TagBuilder(L5xElementBuilder):
         if not row:
             raise ValueError("Tag connection linked data does not exist")
         linked = RxGeneric.from_bytes(row[0])
-        attributes = {
-            item.attribute_id: bytes(item.value)
-            for item in linked.extended_records
-        }
+        attributes = linked.attributes
         metadata = attributes.get(0x64, b"")
         if len(metadata) < 4:
             raise ValueError("Tag connection linked data is incomplete")
@@ -2422,10 +2386,7 @@ class TagBuilder(L5xElementBuilder):
                 continue
             if parsed.cip_type != 0x69:
                 continue
-            attributes = {
-                item.attribute_id: bytes(item.value)
-                for item in parsed.extended_records
-            }
+            attributes = parsed.attributes
             metadata = attributes.get(0x01, b"")
             if len(metadata) >= 8:
                 device = struct.unpack_from("<HHH", metadata, 2)
@@ -2607,51 +2568,28 @@ class TagBuilder(L5xElementBuilder):
             raise ValueError("Alias target module does not exist")
         return row[0] + comp_name[match.end() - 1 :]
 
-    def _current_alias_for(self, name: str) -> Union[str, None]:
-        # Current-layout alias tags keep the same @<object id>@ path as legacy
-        # ones (attribute 0x65), read from the physical record at load time
-        # into alias_paths since parse() cuts the record's last attribute.
-        try:
-            self._cur.execute(
-                "SELECT path FROM alias_paths WHERE object_id=?", (self._object_id,)
-            )
-            row = self._cur.fetchone()
-        except Exception:
-            return None
-        if not row:
-            return None
-        try:
-            return self._legacy_alias_for(bytes(row[0]))
-        except ValueError as e:
-            log.warning(
-                f"Tag '{name}': couldn't resolve its alias target ({e}) -- "
-                "exporting it as a Base tag instead"
-            )
-            return None
-
     def build(self) -> Tag:
         tag = self._build()
         if not tag.data_type and tag.tag_type != "Alias":
             tag.data_type = self._taginfo_data_type(tag.name) or tag.data_type
-        # Attach the stored value bytes from the tag's data object, if any.
-        # Current layout: data_table_instance is the data object's id. Legacy
-        # layout: data_table_instance is a data-table address and the data
-        # object's id is the record's first u32 (data_instance_id).
-        try:
-            data_object_id = tag._data_table_instance
-            self._cur.execute("SELECT record FROM comps WHERE object_id=?", (self._object_id,))
-            rec = self._cur.fetchone()
-            if rec and isinstance(RxGeneric.from_bytes(rec[0]), LegacyRxGeneric):
-                data_object_id = struct.unpack_from("<I", bytes(rec[0]), 0)[0]
-            self._cur.execute("SELECT data FROM tag_data WHERE object_id=?", (data_object_id,))
-            row = self._cur.fetchone()
-        except Exception:
-            row = None
-        if row:
-            tag._data = bytes(row[0])
-        if rec:
-            tag.usage = _program_tag_usage(bytes(rec[0]))
+        r = self._record
+        if r is not None:
+            data = self._data_object_value(r.data_object_id)
+            if data is not None:
+                tag._data = data
+            tag.usage = _program_tag_usage(r)
         return tag
+
+    def _data_object_value(self, object_id: int) -> Union[bytes, None]:
+        """The stored value bytes (attribute 0x66) of a tag's data object."""
+        self._cur.execute("SELECT record FROM comps WHERE object_id=?", (object_id,))
+        row = self._cur.fetchone()
+        if not row:
+            return None
+        try:
+            return RxGeneric.from_bytes(row[0]).attribute(0x66)
+        except Exception:
+            return None
 
     def _build(self) -> Tag:
         self._cur.execute(
@@ -2671,6 +2609,8 @@ class TagBuilder(L5xElementBuilder):
             external_access = "Read/Write"
             constant = None
 
+        # The parsed tag record, kept for build(); None when it isn't a tag.
+        self._record = None
         try:
             r = RxGeneric.from_bytes(raw_rec)
         except Exception:
@@ -2682,6 +2622,7 @@ class TagBuilder(L5xElementBuilder):
             return Tag(
                 results[0][0], results[0][0], "Base", "", None, external_access, constant, None, 0, []
             )
+        self._record = r
 
         if isinstance(r, LegacyRxGeneric):
             # Program tags: (program, tag); controller tags: (tag, 0).
@@ -2708,11 +2649,7 @@ class TagBuilder(L5xElementBuilder):
             )
         comment_results = self._cur.fetchall()
 
-        extended_records: Dict[int, bytes] = {}
-        for extended_record in r.extended_records:
-            extended_records[extended_record.attribute_id] = bytes(
-                extended_record.value
-            )
+        extended_records = r.attributes
 
         if isinstance(r, LegacyRxGeneric):
             metadata_name = r.logical_name
@@ -2819,7 +2756,17 @@ class TagBuilder(L5xElementBuilder):
             alias_name = bytes(extended_records[0x01][2 : name_length + 2]).decode(
                 "utf-8", errors="replace"
             )
-        alias_for = self._current_alias_for(alias_name)
+        alias_for = None
+        if 0x65 in extended_records:
+            # Current-layout alias tags keep the same @<object id>@ path as
+            # legacy ones, in attribute 0x65.
+            try:
+                alias_for = self._legacy_alias_for(extended_records[0x65])
+            except ValueError as e:
+                log.warning(
+                    f"Tag '{alias_name}': couldn't resolve its alias target ({e}) -- "
+                    "exporting it as a Base tag instead"
+                )
         if alias_for:
             return Tag(
                 alias_name,
@@ -2881,7 +2828,7 @@ class TagBuilder(L5xElementBuilder):
         )
 
 
-def _program_tag_usage(record: bytes) -> Union[str, None]:
+def _program_tag_usage(r) -> Union[str, None]:
     """Usage of a program parameter tag, or None for other tags.
 
     Current-layout program tags (cip_type 0x68) keep usage flags at ext[0x01]
@@ -2889,14 +2836,9 @@ def _program_tag_usage(record: bytes) -> Union[str, None]:
     (both: InOut), and 0x10 Public (seen with 0x04 also set). Local tags carry
     only 0x02.
     """
-    try:
-        r = RxGeneric.from_bytes(record)
-    except Exception:
-        return None
     if isinstance(r, LegacyRxGeneric) or r.cip_type != 0x68:
         return None
-    ext01 = next((bytes(e.value) for e in r.extended_records if e.attribute_id == 0x01), b"")
-    flags = _aoi_tag_usage_flags(ext01)
+    flags = _aoi_tag_usage_flags(r.attribute(0x01) or b"")
     if flags & 0x10:
         return "Public"
     if flags & 0x0C == 0x0C:
@@ -2955,9 +2897,7 @@ class ParameterBuilder(L5xElementBuilder):
 
         try:
             r = RxGeneric.from_bytes(raw_rec)
-            exts: Dict[int, bytes] = {
-                er.attribute_id: bytes(er.value) for er in r.extended_records
-            }
+            exts = r.attributes
         except Exception:
             return Parameter(name, name, "Base", data_type, "Input", None, "false", "false", "Read/Write", None, dimensions)
 
@@ -3052,9 +2992,7 @@ class LocalTagBuilder(L5xElementBuilder):
 
         try:
             r = RxGeneric.from_bytes(raw_rec)
-            exts: Dict[int, bytes] = {
-                er.attribute_id: bytes(er.value) for er in r.extended_records
-            }
+            exts = r.attributes
         except Exception:
             return LocalTag(name, name, data_type, dimensions, None, "Read/Write")
 
@@ -3186,34 +3124,22 @@ class RoutineBuilder(L5xElementBuilder):
 
         try:
             r = RxGeneric.from_bytes(results[0][3])
-        except Exception as e:
-            # Source-protected (encrypted) routines carry unreadable extended
-            # attributes, but their 60-byte main record is intact, so the
-            # routine type can still be read from it (0x30 of the main record,
-            # which starts at 14).
-            raw = bytes(results[0][3])
-            routine_type = (
-                routine_type_enum(struct.unpack_from("<H", raw, 14 + 0x30)[0])
-                if len(raw) >= 74
-                else ""
-            )
+        except Exception:
+            r = None
+        if r is None or r.protected:
+            # A source-protected routine keeps only its main record (and so
+            # its type) readable.
             owner = _routine_owner_name(self._cur, results[0][2])
             conversion_notes.add(
                 f"Routine '{owner + '/' if owner else ''}{results[0][0]}': content "
                 "could not be read (likely source-protected); exported with no rungs"
             )
+            routine_type = routine_type_enum(r.routine_type) if r is not None else ""
             return Routine(results[0][0], results[0][0], routine_type, [])
 
         record = results[0][3]
         name = results[0][0]
-        # The routine type follows the routine's cip_type (0x6D) in both
-        # layouts: at 0x30 of the main record in current files, at raw offset
-        # 0x0C (right after cip_type at 0x08) in the legacy layout.
-        if isinstance(r, LegacyRxGeneric):
-            type_index = struct.unpack_from("<H", bytes(record), 0x0C)[0]
-        else:
-            type_index = struct.unpack_from("<H", r.record_buffer, 0x30)[0]
-        routine_type = routine_type_enum(type_index)
+        routine_type = routine_type_enum(r.routine_type)
 
         self._cur.execute(
             "SELECT rm.object_id, r.rung FROM region_map rm "
@@ -3395,19 +3321,6 @@ def _parse_aoi_nameless(data: bytes) -> dict:
     return result
 
 
-# Source protection stores a record's attribute block as an encrypted
-# envelope. The envelope starts with this u32 where a plain record has its
-# attribute count (offset 78, right after the 60-byte main record and the
-# length field); the main record before it stays readable. Nameless records
-# carry the same envelope after their 24-byte header.
-_ENCRYPTED_ENVELOPE_MAGIC = 0x0AAA96AA
-
-
-def _is_source_protected(record: bytes) -> bool:
-    """True when an Rx record's attributes are stored encrypted."""
-    return len(record) >= 82 and struct.unpack_from("<I", record, 78)[0] == _ENCRYPTED_ENVELOPE_MAGIC
-
-
 def _aoi_data_type_description(cur, name: str) -> Union[str, None]:
     """Description of an AOI read from its backing data type's comments.
 
@@ -3484,20 +3397,17 @@ class AoiBuilder(L5xElementBuilder):
 
         aoi_record = bytes(results[0][3])
         name = results[0][0]
-        if _is_source_protected(aoi_record):
+        try:
+            _r_aoi = RxGeneric.from_bytes(aoi_record)
+        except Exception:
+            _r_aoi = None
+        if _r_aoi is not None and _r_aoi.protected:
             return self._build_protected(name)
 
         # --- Revision (major.minor) from ext[0x01] ---
-        _r_aoi: Union[RxGeneric, None] = None
-        try:
-            r = RxGeneric.from_bytes(aoi_record)
-            _r_aoi = r
-            exts: Dict[int, bytes] = {e.attribute_id: bytes(e.value) for e in r.extended_records}
-            e01 = exts.get(0x01, b"")
-            rev_major = struct.unpack_from("<H", e01, 0x1A)[0] if len(e01) > 0x1B else 1
-            rev_minor = struct.unpack_from("<H", e01, 0x1C)[0] if len(e01) > 0x1D else 0
-        except Exception:
-            rev_major, rev_minor = 1, 0
+        e01 = (_r_aoi.attribute(0x01) or b"") if _r_aoi is not None else b""
+        rev_major = struct.unpack_from("<H", e01, 0x1A)[0] if len(e01) > 0x1B else 1
+        rev_minor = struct.unpack_from("<H", e01, 0x1C)[0] if len(e01) > 0x1D else 0
         revision = f"{rev_major}.{rev_minor}"
 
         # --- Vendor from comps record ---
@@ -3541,10 +3451,7 @@ class AoiBuilder(L5xElementBuilder):
                 is_param = False
                 try:
                     r_child = RxGeneric.from_bytes(child_rec)
-                    exts_child: Dict[int, bytes] = {
-                        er.attribute_id: bytes(er.value)
-                        for er in r_child.extended_records
-                    }
+                    exts_child = r_child.attributes
                     ext01 = exts_child.get(0x01, b"")
                     flags = _aoi_tag_usage_flags(ext01)
                     is_param = bool(flags & 0x0C)
@@ -3627,7 +3534,7 @@ class ProgramBuilder(L5xElementBuilder):
 
         # --- MainRoutineName and FaultRoutineName from extended records ---
         # ext[0x12D] = MainRoutine object_id, ext[0x066] = FaultRoutine object_id
-        exts: Dict[int, bytes] = {e.attribute_id: bytes(e.value) for e in r.extended_records}
+        exts = r.attributes
         main_routine_name: Union[str, None] = None
         fault_routine_name: Union[str, None] = None
         if 0x12D in exts and len(exts[0x12D]) >= 4:
@@ -3727,31 +3634,11 @@ _TASK_TYPE_MAP = {1: "EVENT", 2: "PERIODIC", 4: "CONTINUOUS"}
 def _program_schedule_id(record: bytes) -> int:
     parsed = RxGeneric.from_bytes(record)
     if isinstance(parsed, LegacyRxGeneric):
-        metadata = next(
-            (
-                bytes(item.value)
-                for item in parsed.extended_records
-                if item.attribute_id == 0x01
-            ),
-            b"",
-        )
+        metadata = parsed.attribute(0x01) or b""
         if len(metadata) < 271:
             raise ValueError("Program record does not contain a schedule ID")
         return struct.unpack_from("<I", metadata, 267)[0]
     return parsed.comment_id
-
-
-def _rx_attribute(record: bytes, attribute_id: int) -> Union[bytes, None]:
-    try:
-        parsed = RxGeneric.from_bytes(record)
-    except Exception:
-        return None
-    if isinstance(parsed, LegacyRxGeneric):
-        return None
-    for item in parsed.extended_records:
-        if item.attribute_id == attribute_id:
-            return bytes(item.value)
-    return None
 
 
 @dataclass
@@ -3765,34 +3652,19 @@ class TaskBuilder(L5xElementBuilder):
 
         # All task config fields live within ext[0x01]; offsets below are
         # relative to that attribute's value (reverse-engineered from
-        # CIPDemo_RevEng.ACD, where it starts at record offset 0x5A). Other
-        # attributes may precede it, so it is located by id, not position.
-        task_attribute = _rx_attribute(record, 0x01) if len(record) > 0x112E else None
-        if task_attribute is not None and len(task_attribute) > 0x10D4:
-            task_data = task_attribute
+        # CIPDemo_RevEng.ACD). The current layout's attribute is larger than
+        # 0x10D4 bytes; the legacy layout's is at least 806.
+        task_data = RxGeneric.from_bytes(record).attribute(0x01) or b""
+        if len(task_data) > 0x10D4:
             rate_offset = 0x1012
             type_offset = 0x109C
             priority_offset = 0x109E
             watchdog_offset = 0x10B0
-            disable_update = task_attribute[0x10D4]
+            disable_update = task_data[0x10D4]
             program_offset = 0
-        elif len(record) > 0x112E:
-            task_data = record
-            rate_offset = 0x106C
-            type_offset = 0x10F6
-            priority_offset = 0x10F8
-            watchdog_offset = 0x110A
-            disable_update = record[0x112E]
-            program_offset = 0x5A
+        elif len(task_data) < 806:
+            raise ValueError("Task record does not contain configuration data")
         else:
-            parsed = RxGeneric.from_bytes(record)
-            attributes = {
-                item.attribute_id: bytes(item.value)
-                for item in parsed.extended_records
-            }
-            task_data = attributes.get(0x01, b"")
-            if len(task_data) < 806:
-                raise ValueError("Task record does not contain configuration data")
             rate_offset = 514
             type_offset = 652
             priority_offset = 654
@@ -3893,11 +3765,7 @@ class ControllerBuilder(L5xElementBuilder):
         )
         comment_results = self._cur.fetchall()
 
-        extended_records: Dict[int, bytes] = {}
-        for extended_record in r.extended_records:
-            extended_records[extended_record.attribute_id] = bytes(
-                extended_record.value
-            )
+        extended_records = r.attributes
 
         def _decode_utf16(key):
             raw = extended_records.get(key)
@@ -4134,7 +4002,7 @@ class ControllerBuilder(L5xElementBuilder):
                 try:
                     r = _RxG.from_bytes(bytes(mod_rec))
                     if r.cip_type == 0x69:
-                        exts = {er.attribute_id: bytes(er.value) for er in r.extended_records}
+                        exts = r.attributes
                         e1 = exts.get(0x001, b"")
                         if len(e1) >= 0x30:
                             modid = struct.unpack("<I", e1[0x2C:0x30])[0]

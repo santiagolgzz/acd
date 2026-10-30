@@ -260,41 +260,43 @@ def test_note_text_is_made_safe_for_xml_comments():
 
 def test_current_alias_path_read_past_declared_length():
     from acd.record.comps import CompsRecord
+    from acd.record.rx import RxGeneric
 
     path = "@0a0b0c0d@.@01020304@.7\0".encode("utf-16-le")
     payload = bytearray(82)
     struct.pack_into("<H", payload, 10, 0x6B)
     payload += struct.pack("<II", 0x01, 2) + b"\0\0"
     payload += struct.pack("<II", 0x65, len(path)) + path
+    # The stored attribute length leaves out the last four bytes.
+    struct.pack_into("<II", payload, 74, len(payload) - 78, 2)
     raw = bytearray(148) + payload
     # The declared length stops four bytes short of the physical record.
     struct.pack_into("<I", raw, 0, len(raw) - 4)
-    assert CompsRecord.alias_path(_dat(bytes(raw))) == path
-
-    struct.pack_into("<H", raw, 148 + 10, 0x6A)  # not a tag record
-    assert CompsRecord.alias_path(_dat(bytes(raw))) is None
+    entry = CompsRecord.parse(_dat(bytes(raw)))
+    assert entry is not None
+    assert RxGeneric.from_bytes(entry[5]).attribute(0x65) == path
 
 
 def test_current_alias_resolves_module_tag_names():
     import sqlite3
+
+    import pytest
+
     from acd.l5x.elements import TagBuilder
 
     db = sqlite3.connect(":memory:")
     cur = db.cursor()
     cur.execute("CREATE TABLE comps(object_id int, parent_id int, comp_name text,"
                 " seq_number int, record_type int, record BLOB)")
-    cur.execute("CREATE TABLE alias_paths(object_id int, path BLOB NOT NULL)")
     rows = [(0x11223344, "Rack7"), (0x0A0B0C0D, "&11223344:5:O"), (0x01020304, "Data")]
     for object_id, name in rows:
         cur.execute("INSERT INTO comps VALUES (?, 0, ?, 0, 0, ?)", (object_id, name, b""))
-    cur.execute("INSERT INTO alias_paths VALUES (?, ?)",
-                (99, "@0a0b0c0d@.@01020304@.7\0".encode("utf-16-le")))
-    assert TagBuilder(cur, 99)._current_alias_for("MyAlias") == "Rack7:5:O.Data.7"
-    assert TagBuilder(cur, 98)._current_alias_for("Plain") is None
+    path = "@0a0b0c0d@.@01020304@.7\0".encode("utf-16-le")
+    assert TagBuilder(cur, 99)._legacy_alias_for(path) == "Rack7:5:O.Data.7"
 
-    # An unresolvable target falls back to a Base tag (None) instead of raising.
-    cur.execute("INSERT INTO alias_paths VALUES (?, ?)", (97, "@0f0f0f0f@\0".encode("utf-16-le")))
-    assert TagBuilder(cur, 97)._current_alias_for("Broken") is None
+    # An unresolvable target raises; the builder then exports a Base tag.
+    with pytest.raises(ValueError):
+        TagBuilder(cur, 97)._legacy_alias_for("@0f0f0f0f@\0".encode("utf-16-le"))
 
 
 def test_current_alias_tag_matches_reference_export():

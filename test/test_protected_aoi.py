@@ -2,7 +2,8 @@ import sqlite3
 import struct
 
 from acd.l5x import conversion_notes
-from acd.l5x.elements import AoiBuilder, _is_source_protected
+from acd.l5x.elements import AoiBuilder
+from acd.record.rx import RxGeneric
 
 
 def _rx_record(cip_type: int, comment_id: int, attributes: bytes, count: int) -> bytes:
@@ -49,11 +50,12 @@ def _cursor():
     return connection, cur
 
 
-def test_is_source_protected_reads_envelope_marker():
-    assert _is_source_protected(_protected_record())
+def test_rx_reads_envelope_marker():
+    protected = RxGeneric.from_bytes(_protected_record())
+    assert protected.protected
+    assert (protected.cip_type, protected.comment_id, protected.extended_records) == (0x338, 0x4242, [])
     plain = _rx_record(0x338, 0x4242, struct.pack("<II", 1, 4) + b"\x00" * 4, 1)
-    assert not _is_source_protected(plain)
-    assert not _is_source_protected(b"short")
+    assert not RxGeneric.from_bytes(plain).protected
 
 
 def test_protected_aoi_exports_only_readable_fields():

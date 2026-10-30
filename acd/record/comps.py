@@ -46,7 +46,7 @@ class CompsRecord:
         if dat_record.identifier != 64250:
             return None
         raw = bytes(dat_record.record.record_buffer)
-        if len(raw) < 0x70 or struct.unpack_from("<I", raw, 0x0C)[0] == 0:
+        if len(raw) < 0x70 or not CompsRecord.is_legacy(raw):
             return None
         scope_cip, scope_cid, own_cip, own_cid = struct.unpack_from("<HHHH", raw, 0x68)
         if not scope_cip:
@@ -55,58 +55,10 @@ class CompsRecord:
         return (scope_cid * 0x10000) + scope_cip, member_key
 
     @staticmethod
-    def data_value(dat_record: DatRecord) -> Optional[bytes]:
-        """Return the stored tag data (Rx attribute 0x66) of a FAFA record.
-
-        Tag data objects (children of RxDataCollection, referenced by a tag's
-        data_table_instance) keep the tag's raw value in attribute 0x66, the
-        record's last attribute (kept whole by parse()).
-        """
-        if dat_record.identifier != 64250:
-            return None
-        entry = CompsRecord.parse(dat_record)
-        if entry is None:
-            return None
-        raw = bytes(dat_record.record.record_buffer)
-        # Attributes start at 32 of the legacy payload (see LegacyRxGeneric)
-        # and at 82 of the Rx payload (74-byte header and main record, then
-        # len_record and count_record).
-        pos = 32 if struct.unpack_from("<I", raw, 0x0C)[0] != 0 else 82
-        return CompsRecord._attribute(bytes(entry[5]), pos, 0x66)
-
-    @staticmethod
-    def alias_path(dat_record: DatRecord) -> Optional[bytes]:
-        """Return the alias path (Rx attribute 0x65) of a current-layout tag.
-
-        Alias tags keep their target as a utf-16 path of object IDs, the same
-        form legacy files use (e.g. "@<tag id>@.@<member id>@.13"), as the tag
-        record's last attribute. Legacy records are read through
-        LegacyRxGeneric instead and return None here.
-        """
-        if dat_record.identifier != 64250:
-            return None
-        raw = bytes(dat_record.record.record_buffer)
-        if len(raw) < 158 or struct.unpack_from("<I", raw, 0x0C)[0] != 0:
-            return None
-        entry = CompsRecord.parse(dat_record)
-        if entry is None:
-            return None
-        payload = bytes(entry[5])
-        if struct.unpack_from("<H", payload, 10)[0] not in (0x68, 0x6B):
-            return None
-        return CompsRecord._attribute(payload, 82, 0x65)
-
-    @staticmethod
-    def _attribute(payload: bytes, pos: int, wanted: int) -> Optional[bytes]:
-        """Value of attribute `wanted` in the (u32 id, u32 length, value)
-        list starting at `pos`; None when absent or cut short."""
-        while pos + 8 <= len(payload):
-            attribute_id, length = struct.unpack_from("<II", payload, pos)
-            if attribute_id == wanted:
-                value = payload[pos + 8 : pos + 8 + length]
-                return value if len(value) == length else None
-            pos += 8 + length
-        return None
+    def is_legacy(raw: bytes) -> bool:
+        """True for a record of the v20-and-earlier layout, whose object id
+        fills the four bytes at 0x0C that newer files leave zero."""
+        return len(raw) >= 0x10 and struct.unpack_from("<I", raw, 0x0C)[0] != 0
 
     @staticmethod
     def parse(dat_record: DatRecord) -> Optional[tuple]:
@@ -116,9 +68,7 @@ class CompsRecord:
         # that are present in newer files. In that layout, the nonzero object
         # ID occupies the reserved field and shifts the remaining header and
         # payload four bytes earlier.
-        if dat_record.identifier in (64250, 65021) and struct.unpack_from(
-            "<I", raw, 0x0C
-        )[0] != 0:
+        if dat_record.identifier in (64250, 65021) and CompsRecord.is_legacy(raw):
             object_id, parent_id = struct.unpack_from("<II", raw, 0x0C)
 
             # 0xFFFFFFFF is the sentinel Rockwell uses for "no object" --
