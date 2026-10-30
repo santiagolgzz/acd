@@ -122,7 +122,10 @@ def test_l5k_scalar_values():
     assert _l5k_from_data("DINT", struct.pack("<i", -42)) == "-42"
     assert _l5k_from_data("INT", struct.pack("<h", 1234) + bytes(2)) == "1234"
     assert _l5k_from_data("REAL", struct.pack("<f", 90.0)) == "9.00000000e+001"
+    assert _l5k_from_data("BOOL", b"\x01") == "1"
+    assert _l5k_from_data("BOOL", b"\x00") == "0"
     assert _l5k_from_data("BOOL", bytes(4)) is None
+    assert _l5k_from_data("BOOL", b"\x07") is None
     assert _l5k_from_data("DINT", bytes(2)) is None
 
 
