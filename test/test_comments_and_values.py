@@ -354,13 +354,14 @@ def test_legacy_data_type_members():
     cur = db.cursor()
     cur.execute("CREATE TABLE comps(object_id int, parent_id int, comp_name text, seq_number int, record_type int, record BLOB)")
     cur.execute("CREATE TABLE comment_keys(object_id int, scope_key int, member_key int)")
-    cur.execute("CREATE TABLE comments(parent int, member_ref int, record_string text)")
+    cur.execute("CREATE TABLE comments(seq_number int, sub_record_length int, object_id int, record_string text,"
+                " record_type int, parent int, tag_reference text, rung_content int, member_ref int)")
     cur.executemany("INSERT INTO comps VALUES (?,?,?,0,0,?)", [
         (0x51, 0, "SINT", b""), (0x52, 0, "BOOL", b""), (0x53, 0, "REAL", b""),
         (0x99, 0, "Pump", bytes(record)),
     ])
     cur.execute("INSERT INTO comment_keys VALUES (0x99, 0x1234006C, 0)")
-    cur.execute("INSERT INTO comments VALUES (0x1234006C, 0, 'Made up pump')")
+    cur.execute("INSERT INTO comments VALUES (0, 0, 1, 'Made up pump', 1, 0x1234006C, '', 0, 0)")
 
     pump = DataTypeBuilder(cur, 0x99).build()
     assert (pump.cls, pump._size, pump._description) == ("User", 8, "Made up pump")

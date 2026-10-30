@@ -11,6 +11,15 @@ from acd.generated.comps.fafa_comps import FafaComps
 from acd.generated.comps.fdfd_comps import FdfdComps
 
 
+def comment_keys(buf: bytes, offset: int) -> Tuple[int, int]:
+    """(scope key, member key) from the (cip_type, comment_id) pairs of the
+    owning scope and of the object itself at `offset`; the member key is 0
+    when the object has no scope of its own."""
+    scope_cip, scope_cid, own_cip, own_cid = struct.unpack_from("<HHHH", buf, offset)
+    member_key = (own_cid * 0x10000) + own_cip if own_cip else 0
+    return (scope_cid * 0x10000) + scope_cip, member_key
+
+
 @dataclass
 class RecordData:
     object_id: int
@@ -48,11 +57,9 @@ class CompsRecord:
         raw = bytes(dat_record.record.record_buffer)
         if len(raw) < 0x70 or not CompsRecord.is_legacy(raw):
             return None
-        scope_cip, scope_cid, own_cip, own_cid = struct.unpack_from("<HHHH", raw, 0x68)
-        if not scope_cip:
+        if not struct.unpack_from("<H", raw, 0x68)[0]:
             return None
-        member_key = (own_cid * 0x10000) + own_cip if own_cip else 0
-        return (scope_cid * 0x10000) + scope_cip, member_key
+        return comment_keys(raw, 0x68)
 
     @staticmethod
     def is_legacy(raw: bytes) -> bool:

@@ -233,7 +233,7 @@ class ExportL5x:
         self._cur.execute("CREATE INDEX idx_rung_uids_parent_id ON rung_uids(parent_id)")
         self._cur.execute("CREATE INDEX idx_taginfo_tags_name ON taginfo_tags(name)")
         self._cur.execute("CREATE INDEX idx_comment_keys_object_id ON comment_keys(object_id)")
-        self._cur.execute("CREATE INDEX idx_comments_parent ON comments(parent)")
+        self._cur.execute("CREATE INDEX idx_comments_parent_member ON comments(parent, member_ref)")
         self._cur.execute("CREATE INDEX idx_st_lines_routine_id ON st_lines(routine_id)")
         self._db.commit()
 

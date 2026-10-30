@@ -17,6 +17,7 @@ from loguru import logger as log
 from acd.l5x import conversion_notes
 from acd.l5x.catalog_numbers import CATALOG_NUMBERS, catalog_number_for_identity
 from acd.l5x.port_structures import PORT_STRUCTURES
+from acd.record.comps import comment_keys
 from acd.record.rx import LegacyRxGeneric, RxGeneric
 
 
@@ -1991,14 +1992,7 @@ class DataTypeBuilder(L5xElementBuilder):
     def _legacy_description(self) -> Union[str, None]:
         """A legacy-layout type's description, filed under its own comment key."""
         scope_key, _ = _legacy_comment_keys(self._cur, self._object_id)
-        if not scope_key:
-            return None
-        self._cur.execute(
-            "SELECT record_string FROM comments WHERE parent=? AND member_ref=0 LIMIT 1",
-            (scope_key,),
-        )
-        row = self._cur.fetchone()
-        return row[0] if row and row[0] else None
+        return _own_description(self._cur, scope_key, None, 0)
 
 
 @dataclass
@@ -2624,23 +2618,14 @@ class TagBuilder(L5xElementBuilder):
             )
         self._record = r
 
-        if isinstance(r, LegacyRxGeneric):
-            # Program tags: (program, tag); controller tags: (tag, 0).
-            scope_key, member_key = _legacy_comment_keys(self._cur, self._object_id)
-        else:
-            scope_key, member_key = scoped_comment_keys(raw_rec)
-        if member_key:
-            # Program tag: only the comments filed under this tag's own key,
-            # not every comment in the program's scope.
+        # Program tags: (program, tag); controller tags: (tag, 0).
+        scope_key, member_key = _comment_keys(self._cur, self._object_id, r, raw_rec)
+        if member_key or isinstance(r, LegacyRxGeneric):
+            # Only the comments filed under this tag's own key, not every
+            # comment in the program's scope.
             self._cur.execute(
                 "SELECT tag_reference, record_string FROM comments WHERE parent=? AND member_ref=?",
                 (scope_key, member_key),
-            )
-        elif isinstance(r, LegacyRxGeneric):
-            # Controller tag: comments filed under the tag's own key.
-            self._cur.execute(
-                "SELECT tag_reference, record_string FROM comments WHERE parent=? AND member_ref=0",
-                (scope_key,),
             )
         else:
             self._cur.execute(
@@ -3083,9 +3068,7 @@ def scoped_comment_keys(raw: bytes) -> Tuple[int, int]:
     """
     if len(raw) < 0x12:
         return 0, 0
-    scope_cip, scope_cid, own_cip, own_cid = struct.unpack_from("<HHHH", raw, 0x0A)
-    member_key = (own_cid * 0x10000) + own_cip if own_cip else 0
-    return (scope_cid * 0x10000) + scope_cip, member_key
+    return comment_keys(raw, 0x0A)
 
 
 def _legacy_comment_keys(cur: Cursor, object_id: int) -> Tuple[int, int]:
@@ -3099,6 +3082,13 @@ def _legacy_comment_keys(cur: Cursor, object_id: int) -> Tuple[int, int]:
     except Exception:
         row = None
     return (row[0], row[1]) if row else (0, 0)
+
+
+def _comment_keys(cur: Cursor, object_id: int, r, raw: bytes) -> Tuple[int, int]:
+    """(scope key, member key) of a parsed Rx record of either layout."""
+    if isinstance(r, LegacyRxGeneric):
+        return _legacy_comment_keys(cur, object_id)
+    return scoped_comment_keys(raw)
 
 
 def _routine_owner_name(cur: Cursor, collection_id: int) -> str:
@@ -3177,11 +3167,8 @@ class RoutineBuilder(L5xElementBuilder):
         # comments from internal metadata strings like FBDRoutineDescription which
         # have rung_content=0).
         rung_comments: Dict[int, str] = {}
+        scope_key, member_key = _comment_keys(self._cur, self._object_id, r, record)
         try:
-            if isinstance(r, LegacyRxGeneric):
-                scope_key, member_key = _legacy_comment_keys(self._cur, self._object_id)
-            else:
-                scope_key, member_key = scoped_comment_keys(record)
             if member_key:
                 # Rung comments sit in the program's comment scope with
                 # member_ref = the routine's own key, and the high half of
@@ -3203,27 +3190,10 @@ class RoutineBuilder(L5xElementBuilder):
                     rung_index = index_by_uid.get(rung_content >> 16)
                     if rung_index is not None and rec_str and rung_index not in rung_comments:
                         rung_comments[rung_index] = rec_str
-            else:
-                # Older layout: comments under the routine's own key, with
-                # object_id as the 1-based rung index (rung 0 -> object_id=1).
-                comment_parent = (r.comment_id * 0x10000) + r.cip_type
-                self._cur.execute(
-                    "SELECT object_id, record_string FROM comments "
-                    "WHERE parent=? AND record_type=1 AND rung_content!=0",
-                    (comment_parent,),
-                )
-                for obj_id, rec_str in self._cur.fetchall():
-                    rung_index = obj_id - 1  # convert 1-based to 0-based
-                    if rung_index >= 0 and rec_str and rung_index not in rung_comments:
-                        rung_comments[rung_index] = rec_str
         except Exception:
             pass
 
         # The routine's description: same key as its rung comments, no rung.
-        if isinstance(r, LegacyRxGeneric):
-            scope_key, member_key = _legacy_comment_keys(self._cur, self._object_id)
-        else:
-            scope_key, member_key = scoped_comment_keys(record)
         if member_key:
             description = _own_description(self._cur, scope_key, None, member_key)
         else:
@@ -3340,13 +3310,7 @@ def _aoi_data_type_description(cur, name: str) -> Union[str, None]:
         r = RxGeneric.from_bytes(bytes(row[0]))
     except Exception:
         return None
-    cur.execute(
-        "SELECT record_string FROM comments WHERE parent=? AND member_ref=0 "
-        "AND record_type=1 AND tag_reference='' LIMIT 1",
-        ((r.comment_id * 0x10000) + r.cip_type,),
-    )
-    desc_row = cur.fetchone()
-    return desc_row[0] if desc_row and desc_row[0] else None
+    return _own_description(cur, (r.comment_id * 0x10000) + r.cip_type, None, 0)
 
 
 @dataclass
