@@ -2,7 +2,7 @@ import struct
 from dataclasses import dataclass
 from io import BytesIO
 from sqlite3 import Cursor
-from typing import Optional
+from typing import Optional, Tuple
 
 from acd.database.dbextract import DatRecord
 from kaitaistruct import KaitaiStream
@@ -31,6 +31,61 @@ class CompsRecord:
             return
         self._cur.execute(f"DELETE FROM comps WHERE object_id={entry[0]}")
         self._cur.execute("INSERT INTO comps VALUES (?, ?, ?, ?, ?, ?)", entry)
+
+    @staticmethod
+    def legacy_comment_keys(dat_record: DatRecord) -> Optional[Tuple[int, int]]:
+        """(scope key, member key) of a legacy (v20 and earlier) FAFA record.
+
+        The legacy record keeps the same Rx header fields as the current
+        layout's 0x08-0x12 at raw 0x66-0x70, inside the area parse() skips:
+        u16 format, then (cip_type, comment_id) of the owning scope and of the
+        object itself. Comments are filed under parent = scope key and
+        member_ref = own key; objects without a scope (controller tags) carry
+        their own key first and member key 0.
+        """
+        if dat_record.identifier != 64250:
+            return None
+        raw = bytes(dat_record.record.record_buffer)
+        if len(raw) < 0x70 or struct.unpack_from("<I", raw, 0x0C)[0] == 0:
+            return None
+        scope_cip, scope_cid, own_cip, own_cid = struct.unpack_from("<HHHH", raw, 0x68)
+        if not scope_cip:
+            return None
+        member_key = (own_cid * 0x10000) + own_cip if own_cip else 0
+        return (scope_cid * 0x10000) + scope_cip, member_key
+
+    @staticmethod
+    def data_value(dat_record: DatRecord) -> Optional[bytes]:
+        """Return the stored tag data (Rx attribute 0x66) of a FAFA record.
+
+        Tag data objects (children of RxDataCollection, referenced by a tag's
+        data_table_instance) keep the tag's raw value in attribute 0x66. That
+        attribute is the last one and runs past the record's declared length,
+        which parse() truncates at, so it is read from the physical record.
+        """
+        if dat_record.identifier != 64250:
+            return None
+        raw = bytes(dat_record.record.record_buffer)
+        if len(raw) < 0x10:
+            return None
+        if struct.unpack_from("<I", raw, 0x0C)[0] != 0:
+            # Legacy layout: parse() keeps the whole record; attributes start
+            # at 32 (see LegacyRxGeneric).
+            entry = CompsRecord.parse(dat_record)
+            if entry is None:
+                return None
+            payload, pos = bytes(entry[5]), 32
+        else:
+            # Rx layout: 74-byte header and main record, then len_record and
+            # count_record, then (u32 attribute_id, u32 length, value) entries.
+            payload, pos = raw[148:], 82
+        while pos + 8 <= len(payload):
+            attribute_id, length = struct.unpack_from("<II", payload, pos)
+            if attribute_id == 0x66:
+                value = payload[pos + 8 : pos + 8 + length]
+                return value if len(value) == length else None
+            pos += 8 + length
+        return None
 
     @staticmethod
     def parse(dat_record: DatRecord) -> Optional[tuple]:

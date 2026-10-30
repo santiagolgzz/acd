@@ -465,7 +465,7 @@ def test_legacy_program_schedule_id_and_task():
         database.close()
 
 
-def test_legacy_task_rejects_excess_program_count():
+def test_legacy_task_ignores_excess_program_count():
     task_data = bytearray(806)
     struct.pack_into("<H", task_data, 0, 129)
     task_record = _legacy_rx(
@@ -475,7 +475,9 @@ def test_legacy_task_rejects_excess_program_count():
     database, cursor = _database()
     try:
         _insert(cursor, 100, "MainTask", task_record)
-        with pytest.raises(ValueError, match="too many scheduled programs"):
-            TaskBuilder(cursor, 100).build({})
+        # An implausible count means an unknown task layout: keep the task,
+        # drop the unreadable schedule list.
+        task = TaskBuilder(cursor, 100).build({})
+        assert task.scheduled_programs == []
     finally:
         database.close()

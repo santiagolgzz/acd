@@ -2,7 +2,7 @@ import re
 import struct
 from dataclasses import dataclass
 from sqlite3 import Cursor
-from typing import Optional
+from typing import Optional, Tuple
 
 from acd.database.dbextract import DatRecord
 from acd.generated.comments.fafa_coments import FafaComents
@@ -57,6 +57,47 @@ class CommentsRecord:
             return (udi_type, text)
         except Exception:
             return None
+
+    @staticmethod
+    def _utf16z(buf: bytes, pos: int) -> Tuple[str, int]:
+        """Read a null-terminated UTF-16LE string; return it and the offset after the null."""
+        end = pos
+        while end + 1 < len(buf) and buf[end : end + 2] != b"\0\0":
+            end += 2
+        return buf[pos:end].decode("utf-16-le", errors="replace"), end + 2
+
+    @staticmethod
+    def parse_legacy(dat_record: DatRecord) -> Optional[tuple]:
+        """Parse a comment record of the legacy (v19/v20) layout.
+
+        The header has no sub_record_length: u32 record_length, u16 seq_number,
+        u16 record_type, u32 parent. Text is UTF-16LE. Keys match the current
+        layout: parent is the owning scope, the next u32 the member (routine or
+        tag) key, and for rung comments the u32 after it the rung key.
+          type 1:    member_ref @12, rung_content @16, text @29
+          type 3, 4: member_ref @12, tag_reference @27, then text
+        Other record types are not decoded.
+        """
+        if dat_record.identifier != 64250:
+            return None
+        buf = bytes(dat_record.record.record_buffer)
+        if len(buf) < 30:
+            return None
+        seq_number, record_type, parent, member_ref, rung_content = struct.unpack_from(
+            "<HHIII", buf, 4
+        )
+        if record_type == 1:
+            text, _ = CommentsRecord._utf16z(buf, 29)
+            tag_ref = ""
+        elif record_type in (3, 4):
+            tag_ref, pos = CommentsRecord._utf16z(buf, 27)
+            text, _ = CommentsRecord._utf16z(buf, pos)
+            rung_content = 0
+        else:
+            return None
+        return (
+            seq_number, 0, 1, text, record_type, parent, tag_ref, rung_content, member_ref,
+        )
 
     @staticmethod
     def parse(dat_record: DatRecord) -> Optional[tuple]:

@@ -1,4 +1,5 @@
 import html
+import math
 import os
 import re
 import shutil
@@ -204,6 +205,10 @@ class Member(L5xElement):
     bit_number: Union[int, None]  # BIT members only; None omits the attribute
     external_access: str
     _description: Union[str, None] = field(default=None)
+    # Byte offset of the member's data in the structure (for BIT members, of
+    # the host field) and bit number within it, from the member record.
+    _offset: int = 0
+    _bit: int = 0
 
     def to_xml(self) -> str:
         base = super().to_xml()
@@ -221,6 +226,8 @@ class DataType(L5xElement):
     cls: str
     members: List[Member]
     _description: Union[str, None] = field(default=None)
+    # Size of the structure in bytes (Rx attribute 0x65); 0 when unknown.
+    _size: int = 0
 
     def __post_init__(self):
         super().__post_init__()
@@ -509,6 +516,317 @@ def _generate_decorated(dt_base: str, dimensions: Union[str, None],
     return f'<Data Format="Decorated">\n{body}\n</Data>'
 
 
+# Stored tag values (a tag data object's attribute 0x66) are the controller's
+# little-endian memory image of the tag. Only the layouts below are decoded;
+# everything else (AOI instances, types without a known size, and the types in
+# _SKIP_DECORATED) keeps the zero defaults above.
+_PRIMITIVE_FORMAT: Dict[str, str] = {
+    "SINT": "<b", "INT": "<h", "DINT": "<i", "LINT": "<q",
+    "USINT": "<B", "UINT": "<H", "UDINT": "<I", "ULINT": "<Q",
+    "REAL": "<f", "LREAL": "<d",
+}
+
+# Control-word bit names of built-in structs, from bit 31 down. The DINT after
+# the control word is PRE (LEN for CONTROL) and the next one ACC (POS).
+_BUILTIN_STRUCT_BITS: Dict[str, List[str]] = {
+    "TIMER": ["EN", "TT", "DN"],
+    "COUNTER": ["CU", "CD", "DN", "OV", "UN"],
+    "CONTROL": ["EN", "EU", "DN", "EM", "ER", "UL", "IN", "FD"],
+}
+
+# STRING: LEN (DINT) + DATA (SINT[82]) + 2 pad bytes.
+_STRING_SIZE = 88
+_STRING_DATA_LEN = 82
+
+
+def _element_size(dt_base: str,
+                  data_types_map: Union[Dict[str, "DataType"], None] = None) -> Union[int, None]:
+    fmt = _PRIMITIVE_FORMAT.get(dt_base)
+    if fmt is not None:
+        return struct.calcsize(fmt)
+    if dt_base in _BUILTIN_STRUCT_BITS:
+        return 12
+    if dt_base == "STRING":
+        return _STRING_SIZE
+    dt_obj = (data_types_map or {}).get(dt_base)
+    if dt_obj is not None and dt_obj._size and dt_base not in _SKIP_DECORATED:
+        return dt_obj._size
+    return None
+
+
+def _type_name(dt_base: str, data_types_map: Union[Dict[str, "DataType"], None]) -> str:
+    """The declared spelling of a type name (map keys are upper-cased)."""
+    dt_obj = (data_types_map or {}).get(dt_base)
+    return dt_obj.name if dt_obj is not None else dt_base
+
+
+def _value_inner_xml(dt_base: str, raw: bytes,
+                     data_types_map: Dict[str, "DataType"]) -> Union[str, None]:
+    """Members XML of one structure value (built-in or user type), or None."""
+    if dt_base in _BUILTIN_STRUCT_BITS or dt_base == "STRING":
+        return _struct_value_members_xml(dt_base, raw)
+    dt_obj = data_types_map.get(dt_base)
+    if dt_obj is None or dt_base in _SKIP_DECORATED or not dt_obj._size:
+        return None
+    parts = []
+    for member in dt_obj.members:
+        if member.hidden:
+            continue
+        fragment = _member_value_xml(member, raw, data_types_map)
+        if fragment is None:
+            return None
+        parts.append(fragment)
+    return "".join(parts)
+
+
+def _member_value_xml(member: "Member", raw: bytes,
+                      data_types_map: Dict[str, "DataType"]) -> Union[str, None]:
+    mdt = member.data_type.upper()
+    name, offset, dim = member.name, member._offset, member.dimension
+
+    def bit_value(bit_index: int) -> Union[str, None]:
+        byte = offset + bit_index // 8
+        return str((raw[byte] >> (bit_index % 8)) & 1) if byte < len(raw) else None
+
+    if mdt in ("BIT", "BOOL") and dim == 0:
+        value = bit_value(member._bit)
+        if value is None:
+            return None
+        return f'<DataValueMember Name="{name}" DataType="BOOL" Value="{value}"/>'
+
+    if dim > 0 and mdt == "BOOL":
+        # BOOL array members are packed 32 to a DINT.
+        values = [bit_value(i) for i in range(dim)]
+        if None in values:
+            return None
+        elems = "".join(f'<Element Index="[{i}]" Value="{v}"/>' for i, v in enumerate(values))
+        return (
+            f'<ArrayMember Name="{name}" DataType="BOOL" Dimensions="{dim}" Radix="Decimal">'
+            f'{elems}</ArrayMember>'
+        )
+
+    size = _element_size(mdt, data_types_map)
+    if size is None or offset + size * max(dim, 1) > len(raw):
+        return None
+
+    def element(i: int) -> Union[str, None]:
+        chunk = raw[offset + i * size : offset + (i + 1) * size]
+        if mdt in _PRIMITIVE_FORMAT:
+            return _format_number(mdt, chunk, l5k=False)
+        return _value_inner_xml(mdt, chunk, data_types_map)
+
+    if dim == 0:
+        value = element(0)
+        if value is None:
+            return None
+        if mdt in _PRIMITIVE_FORMAT:
+            return (
+                f'<DataValueMember Name="{name}" DataType="{mdt}" '
+                f'Radix="{_PRIMITIVE_RADIX[mdt]}" Value="{value}"/>'
+            )
+        return f'<StructureMember Name="{name}" DataType="{_type_name(mdt, data_types_map)}">{value}</StructureMember>'
+
+    values = [element(i) for i in range(dim)]
+    if None in values:
+        return None
+    if mdt in _PRIMITIVE_FORMAT:
+        elems = "".join(f'<Element Index="[{i}]" Value="{v}"/>' for i, v in enumerate(values))
+        return (
+            f'<ArrayMember Name="{name}" DataType="{mdt}" Dimensions="{dim}" '
+            f'Radix="{_PRIMITIVE_RADIX[mdt]}">{elems}</ArrayMember>'
+        )
+    type_name = _type_name(mdt, data_types_map)
+    elems = "".join(
+        f'<Element Index="[{i}]"><Structure DataType="{type_name}">{v}</Structure></Element>'
+        for i, v in enumerate(values)
+    )
+    return f'<ArrayMember Name="{name}" DataType="{type_name}" Dimensions="{dim}">{elems}</ArrayMember>'
+
+
+def _format_number(dt_base: str, raw: bytes, l5k: bool) -> str:
+    value = struct.unpack(_PRIMITIVE_FORMAT[dt_base], raw)[0]
+    if dt_base not in ("REAL", "LREAL"):
+        return str(value)
+    if math.isnan(value) or math.isinf(value):
+        # Logix spells non-finite floats the way the MSVC runtime prints them.
+        text = "1.#QNAN" if math.isnan(value) else ("-1.#INF" if value < 0 else "1.#INF")
+        return text + ("000e+000" if text.endswith("NAN") else "0000e+000") if l5k else text
+    if l5k:
+        # L5K writes floats as 0.00000000e+000 (three exponent digits).
+        mantissa, exponent = f"{value:.8e}".split("e")
+        return f"{mantissa}e{exponent[0]}{int(exponent[1:]):03d}"
+    if dt_base == "REAL":
+        # Shortest text that reads back as the same 32-bit float.
+        for precision in range(1, 10):
+            text = f"{value:.{precision}g}"
+            if struct.pack("<f", float(text)) == raw:
+                break
+    else:
+        text = repr(value)
+    if text.replace("-", "").isdigit():
+        text += ".0"
+    return text
+
+
+def _logix_string(raw: bytes) -> str:
+    """Quote bytes as a Logix ASCII string literal ($ escapes, single quotes)."""
+    out = []
+    for b in raw:
+        ch = chr(b)
+        if ch == "$":
+            out.append("$$")
+        elif ch == "'":
+            out.append("$'")
+        elif 0x20 <= b < 0x7F:
+            out.append(ch)
+        else:
+            out.append(f"${b:02X}")
+    return "'" + "".join(out) + "'"
+
+
+def _struct_value_members_xml(dt_base: str, raw: bytes) -> Union[str, None]:
+    if dt_base == "STRING":
+        length = struct.unpack_from("<i", raw, 0)[0]
+        if not 0 <= length <= _STRING_DATA_LEN:
+            return None
+        text = _logix_string(raw[4 : 4 + length])
+        return (
+            f'<DataValueMember Name="LEN" DataType="DINT" Radix="Decimal" Value="{length}"/>'
+            f'<DataValueMember Name="DATA" DataType="STRING" Radix="ASCII">\n'
+            f'<![CDATA[{text}]]>\n</DataValueMember>'
+        )
+    control, first, second = struct.unpack_from("<Iii", raw, 0)
+    names = ("LEN", "POS") if dt_base == "CONTROL" else ("PRE", "ACC")
+    parts = [
+        f'<DataValueMember Name="{names[0]}" DataType="DINT" Radix="Decimal" Value="{first}"/>',
+        f'<DataValueMember Name="{names[1]}" DataType="DINT" Radix="Decimal" Value="{second}"/>',
+    ]
+    for bit, name in enumerate(_BUILTIN_STRUCT_BITS[dt_base]):
+        parts.append(
+            f'<DataValueMember Name="{name}" DataType="BOOL" Value="{(control >> (31 - bit)) & 1}"/>'
+        )
+    return "".join(parts)
+
+
+def _l5k_from_data(dt_base: str, data: bytes) -> Union[str, None]:
+    """L5K text for a scalar numeric or BOOL tag's stored value, or None."""
+    if dt_base == "BOOL":
+        # Scalar BOOLs store one byte, 0 or 1.
+        return str(data[0]) if len(data) == 1 and data[0] in (0, 1) else None
+    size = _element_size(dt_base)
+    if dt_base not in _PRIMITIVE_FORMAT or size is None or not size <= len(data) < size + 8:
+        return None
+    return _format_number(dt_base, data[:size], l5k=True)
+
+
+def _decorated_from_data(dt_base: str, dimensions: Union[str, None], data: bytes,
+                         data_types_map: Union[Dict[str, "DataType"], None] = None) -> Union[str, None]:
+    """<Data Format="Decorated"> holding a tag's stored values, or None.
+
+    None means the type is not decoded or the data size does not match the
+    tag's type and dimensions; the caller then falls back to zero defaults.
+    """
+    dim_parts = (
+        [int(d) for d in dimensions.split(",") if d.strip().isdigit()] if dimensions else []
+    )
+    if dimensions and not dim_parts:
+        return None
+    total = 1
+    for d in dim_parts:
+        total *= d
+
+    if dt_base == "BOOL":
+        # BOOL arrays are packed 32 to a DINT.
+        if not dim_parts or len(data) < ((total + 31) // 32) * 4:
+            return None
+        size = 0
+    else:
+        size = _element_size(dt_base, data_types_map)
+        if size is None or not size * total <= len(data) < size * total + 8:
+            return None
+
+    def element_value(i: int) -> str:
+        if dt_base == "BOOL":
+            return str((data[i // 8] >> (i % 8)) & 1)
+        return _format_number(dt_base, data[i * size : (i + 1) * size], l5k=False)
+
+    if not dim_parts:
+        inner = _value_inner_xml(dt_base, data[:size], data_types_map or {})
+        if inner is None:
+            return None
+        body = f'<Structure DataType="{_type_name(dt_base, data_types_map)}">{inner}</Structure>'
+        return f'<Data Format="Decorated">\n{body}\n</Data>'
+
+    elements = []
+    for i in range(total):
+        index, rest = [], i
+        for d in reversed(dim_parts):
+            index.insert(0, rest % d)
+            rest //= d
+        idx = "[" + "][".join(str(p) for p in index) + "]"
+        if dt_base == "BOOL" or dt_base in _PRIMITIVE_FORMAT:
+            elements.append(f'<Element Index="{idx}" Value="{element_value(i)}"/>')
+        else:
+            inner = _value_inner_xml(dt_base, data[i * size : (i + 1) * size], data_types_map or {})
+            if inner is None:
+                return None
+            elements.append(
+                f'<Element Index="{idx}"><Structure DataType="{_type_name(dt_base, data_types_map)}">{inner}</Structure></Element>'
+            )
+    dim_str = ",".join(str(d) for d in dim_parts)
+    if dt_base == "BOOL":
+        attrs = 'DataType="BOOL" Dimensions="%s" Radix="Decimal"' % dim_str
+    elif dt_base in _PRIMITIVE_FORMAT:
+        attrs = f'DataType="{dt_base}" Dimensions="{dim_str}" Radix="{_PRIMITIVE_RADIX[dt_base]}"'
+    else:
+        attrs = f'DataType="{_type_name(dt_base, data_types_map)}" Dimensions="{dim_str}"'
+    return f'<Data Format="Decorated">\n<Array {attrs}>{"".join(elements)}</Array>\n</Data>'
+
+
+def taginfo_layouts(xml_text: str) -> Dict[str, "DataType"]:
+    """Type layouts (size, member offsets and bits) from a project's TagInfo.XML.
+
+    TagInfo.XML lists every type the project uses, including Add-On
+    Instructions and module-defined types, with byte offsets. Only the
+    layout is kept; it is used to decode stored tag values, not exported.
+    """
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return {}
+    layouts: Dict[str, DataType] = {}
+    for dt in root.iter("DataType"):
+        members = []
+        for m in dt.findall("Members/Member"):
+            dims = [int(d.get("Size", "0")) for d in m.findall("Dimensions/Dim")]
+            dim = 1
+            for d in dims:
+                dim *= d
+            bit = m.get("Bit")
+            members.append(Member(
+                m.get("Name"), m.get("Name"), m.get("DataType", ""), dim if dims else 0,
+                "Decimal", m.get("Hidden") == "true", None,
+                int(bit) if bit is not None else None, "Read/Write",
+                _offset=int(m.get("Offset", "0")), _bit=int(bit) if bit is not None else 0,
+            ))
+        name = dt.get("Name", "")
+        layouts[name.upper()] = DataType(
+            name, name, "NoFamily", "User", members, _size=int(dt.get("Size", "0"))
+        )
+    return layouts
+
+
+def merge_value_types(data_types_map: Dict[str, "DataType"],
+                      taginfo: Dict[str, "DataType"]) -> Dict[str, "DataType"]:
+    """Types for value decoding: the Comps-derived type where it has a size
+    and members, otherwise the TagInfo.XML layout."""
+    merged = dict(taginfo)
+    for key, dt in data_types_map.items():
+        if dt._size and dt.members:
+            merged[key] = dt
+    return merged
+
+
 @dataclass
 class ProduceInfo(L5xElement):
     produce_count: str
@@ -557,6 +875,11 @@ class Tag(L5xElement):
     alias_for: Union[str, None] = None
     produce_info: Union[ProduceInfo, None] = None
     consume_info: Union[ConsumeInfo, None] = None
+    # Raw stored value from the tag's data object; None when not found.
+    _data: Union[bytes, None] = None
+    # Type layouts used to decode _data (see value_types_map); falls back to
+    # _data_types_map when empty.
+    _value_types_map: Dict[str, "DataType"] = field(default_factory=dict)
 
     @property
     def _l5x_exclude(self) -> bool:
@@ -600,6 +923,22 @@ class Tag(L5xElement):
         desc = self._sanitize_xml_text(desc_raw) if desc_raw else None
         desc_xml = f'<Description>\n<![CDATA[{desc}]]>\n</Description>' if desc else ""
 
+        # --- Comments child element: per-bit / per-member descriptions ---
+        # Stored tag_references omit the leading "." in current files (".2"
+        # is stored as "2"); references starting with "!" are not operands.
+        operand_comments: Dict[str, str] = {}
+        for ref, text in self._comments:
+            if not ref or ref == "." or ref.startswith("!") or not text:
+                continue
+            operand = ref if ref[0] in ".[" else "." + ref
+            operand_comments.setdefault(operand.upper(), text)
+        if operand_comments:
+            desc_xml += "<Comments>" + "".join(
+                f'<Comment Operand="{_escape_xml_attr(operand)}">\n'
+                f'<![CDATA[{self._sanitize_xml_text(text)}]]>\n</Comment>'
+                for operand, text in operand_comments.items()
+            ) + "</Comments>"
+
         # --- Data child element(s) ---
         # Scalar primitives get Format="L5K" only.
         # Scalar STRING gets Format="L5K" (the L5K encoder handles it separately; we emit
@@ -607,7 +946,16 @@ class Tag(L5xElement):
         # Everything else (UDTs, arrays, TIMER, COUNTER, etc.) gets Format="Decorated".
         dt_base = self.data_type.split("[")[0].upper() if self.data_type else ""
         l5k_zero = _PRIMITIVE_L5K_ZERO.get(dt_base) if not self.dimensions else None
+        if l5k_zero is not None and self._data and not self.alias_for:
+            l5k_zero = _l5k_from_data(dt_base, self._data) or l5k_zero
         data_xml = f'<Data Format="L5K">\n{l5k_zero}\n</Data>' if l5k_zero is not None else ""
+
+        if not data_xml and self._data and not self.alias_for:
+            data_xml = (
+                _decorated_from_data(
+                    dt_base, self.dimensions, self._data, self._value_types_map or self._data_types_map
+                ) or ""
+            )
 
         if not data_xml and dt_base not in _SKIP_DECORATED and dt_base != "STRING":
             # Generate Decorated data for non-primitive / array types
@@ -1296,7 +1644,11 @@ class MemberBuilder(L5xElementBuilder):
                 if desc_row and desc_row[0]:
                     description = desc_row[0]
 
-        return Member(name, name, data_type, dimension, radix, hidden, target, bit_number, external_access, description)
+        return Member(
+            name, name, data_type, dimension, radix, hidden, target, bit_number, external_access, description,
+            _offset=struct.unpack_from("<I", self.record, 0x60)[0],
+            _bit=struct.unpack_from("<I", self.record, 0x64)[0],
+        )
 
 
 @dataclass
@@ -1418,7 +1770,12 @@ class DataTypeBuilder(L5xElementBuilder):
         if desc_row and desc_row[0]:
             description = desc_row[0]
 
-        return DataType(name, name, string_family, class_type, children, description)
+        size = (
+            struct.unpack("<I", extended_records[0x65])[0]
+            if len(extended_records.get(0x65, b"")) == 4
+            else 0
+        )
+        return DataType(name, name, string_family, class_type, children, description, _size=size)
 
 
 @dataclass
@@ -1968,6 +2325,26 @@ class TagBuilder(L5xElementBuilder):
         return resolved
 
     def build(self) -> Tag:
+        tag = self._build()
+        # Attach the stored value bytes from the tag's data object, if any.
+        # Current layout: data_table_instance is the data object's id. Legacy
+        # layout: data_table_instance is a data-table address and the data
+        # object's id is the record's first u32 (data_instance_id).
+        try:
+            data_object_id = tag._data_table_instance
+            self._cur.execute("SELECT record FROM comps WHERE object_id=?", (self._object_id,))
+            rec = self._cur.fetchone()
+            if rec and isinstance(RxGeneric.from_bytes(rec[0]), LegacyRxGeneric):
+                data_object_id = struct.unpack_from("<I", bytes(rec[0]), 0)[0]
+            self._cur.execute("SELECT data FROM tag_data WHERE object_id=?", (data_object_id,))
+            row = self._cur.fetchone()
+        except Exception:
+            row = None
+        if row:
+            tag._data = bytes(row[0])
+        return tag
+
+    def _build(self) -> Tag:
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record FROM comps WHERE object_id="
             + str(self._object_id)
@@ -1997,10 +2374,29 @@ class TagBuilder(L5xElementBuilder):
                 results[0][0], results[0][0], "Base", "", None, external_access, constant, None, 0, []
             )
 
-        self._cur.execute(
-            "SELECT tag_reference, record_string FROM comments WHERE parent="
-            + str((r.comment_id * 0x10000) + r.cip_type)
-        )
+        if isinstance(r, LegacyRxGeneric):
+            # Program tags: (program, tag); controller tags: (tag, 0).
+            scope_key, member_key = _legacy_comment_keys(self._cur, self._object_id)
+        else:
+            scope_key, member_key = scoped_comment_keys(raw_rec)
+        if member_key:
+            # Program tag: only the comments filed under this tag's own key,
+            # not every comment in the program's scope.
+            self._cur.execute(
+                "SELECT tag_reference, record_string FROM comments WHERE parent=? AND member_ref=?",
+                (scope_key, member_key),
+            )
+        elif isinstance(r, LegacyRxGeneric):
+            # Controller tag: comments filed under the tag's own key.
+            self._cur.execute(
+                "SELECT tag_reference, record_string FROM comments WHERE parent=? AND member_ref=0",
+                (scope_key,),
+            )
+        else:
+            self._cur.execute(
+                "SELECT tag_reference, record_string FROM comments WHERE parent="
+                + str((r.comment_id * 0x10000) + r.cip_type)
+            )
         comment_results = self._cur.fetchall()
 
         extended_records: Dict[int, bytes] = {}
@@ -2349,6 +2745,36 @@ def routine_type_enum(idx: int) -> str:
     return "Typeless"
 
 
+def scoped_comment_keys(raw: bytes) -> Tuple[int, int]:
+    """Return (scope key, member key) for a Comps record.
+
+    Objects owned by a program (routines, program tags) carry the program's
+    comment key (cip_type, comment_id) at 0x0A and their own at 0x0E.
+    RxGeneric reads only the first, so every routine and tag in a program
+    resolves to the same key. Their comments are stored with
+    parent = scope key and member_ref = own key. The member key is 0 for
+    objects that have no owning scope (e.g. controller tags).
+    """
+    if len(raw) < 0x12:
+        return 0, 0
+    scope_cip, scope_cid, own_cip, own_cid = struct.unpack_from("<HHHH", raw, 0x0A)
+    member_key = (own_cid * 0x10000) + own_cip if own_cip else 0
+    return (scope_cid * 0x10000) + scope_cip, member_key
+
+
+def _legacy_comment_keys(cur: Cursor, object_id: int) -> Tuple[int, int]:
+    """(scope key, member key) of a legacy-layout object, from the comment_keys
+    table ExportL5x fills from the record header; (0, 0) if unknown."""
+    try:
+        cur.execute(
+            "SELECT scope_key, member_key FROM comment_keys WHERE object_id=?", (object_id,)
+        )
+        row = cur.fetchone()
+    except Exception:
+        row = None
+    return (row[0], row[1]) if row else (0, 0)
+
+
 @dataclass
 class RoutineBuilder(L5xElementBuilder):
     def build(self) -> Routine:
@@ -2365,9 +2791,14 @@ class RoutineBuilder(L5xElementBuilder):
 
         record = results[0][3]
         name = results[0][0]
-        routine_type = routine_type_enum(
-            struct.unpack_from("<H", r.record_buffer, 0x30)[0]
-        )
+        # The routine type follows the routine's cip_type (0x6D) in both
+        # layouts: at 0x30 of the main record in current files, at raw offset
+        # 0x0C (right after cip_type at 0x08) in the legacy layout.
+        if isinstance(r, LegacyRxGeneric):
+            type_index = struct.unpack_from("<H", bytes(record), 0x0C)[0]
+        else:
+            type_index = struct.unpack_from("<H", r.record_buffer, 0x30)[0]
+        routine_type = routine_type_enum(type_index)
 
         self._cur.execute(
             "SELECT rm.object_id, r.rung FROM region_map rm "
@@ -2400,24 +2831,50 @@ class RoutineBuilder(L5xElementBuilder):
                     )
                 rungs = [_resolve(r) if r else r for r in rungs]
 
-        # Fetch rung-level comments from the comments table.
-        # Rung comments are stored under the routine's own comment parent key
-        # (comment_id * 0x10000 + cip_type), as AsciiRecord (record_type=1) entries
-        # where rung_content != 0 (distinguishes user rung comments from internal
-        # metadata strings like FBDRoutineDescription which have rung_content=0).
-        # The object_id field is the 1-based rung index (rung 0 -> object_id=1).
+        # Fetch rung-level comments from the comments table, as AsciiRecord
+        # (record_type=1) entries where rung_content != 0 (distinguishes user rung
+        # comments from internal metadata strings like FBDRoutineDescription which
+        # have rung_content=0).
         rung_comments: Dict[int, str] = {}
         try:
-            comment_parent = (r.comment_id * 0x10000) + r.cip_type
-            self._cur.execute(
-                "SELECT object_id, record_string FROM comments "
-                "WHERE parent=? AND record_type=1 AND rung_content!=0",
-                (comment_parent,),
-            )
-            for obj_id, rec_str in self._cur.fetchall():
-                rung_index = obj_id - 1  # convert 1-based to 0-based
-                if rung_index >= 0 and rec_str and rung_index not in rung_comments:
-                    rung_comments[rung_index] = rec_str
+            if isinstance(r, LegacyRxGeneric):
+                scope_key, member_key = _legacy_comment_keys(self._cur, self._object_id)
+            else:
+                scope_key, member_key = scoped_comment_keys(record)
+            if member_key:
+                # Rung comments sit in the program's comment scope with
+                # member_ref = the routine's own key, and the high half of
+                # rung_content is the rung uid from RegnLink.Dat.
+                position = {oid: i for i, oid in enumerate(rung_ids)}
+                self._cur.execute(
+                    "SELECT object_id, uid FROM rung_uids WHERE parent_id=?",
+                    (self._object_id,),
+                )
+                index_by_uid = {
+                    uid: position[oid] for oid, uid in self._cur.fetchall() if oid in position
+                }
+                self._cur.execute(
+                    "SELECT rung_content, record_string FROM comments "
+                    "WHERE parent=? AND member_ref=? AND record_type=1 AND rung_content!=0",
+                    (scope_key, member_key),
+                )
+                for rung_content, rec_str in self._cur.fetchall():
+                    rung_index = index_by_uid.get(rung_content >> 16)
+                    if rung_index is not None and rec_str and rung_index not in rung_comments:
+                        rung_comments[rung_index] = rec_str
+            else:
+                # Older layout: comments under the routine's own key, with
+                # object_id as the 1-based rung index (rung 0 -> object_id=1).
+                comment_parent = (r.comment_id * 0x10000) + r.cip_type
+                self._cur.execute(
+                    "SELECT object_id, record_string FROM comments "
+                    "WHERE parent=? AND record_type=1 AND rung_content!=0",
+                    (comment_parent,),
+                )
+                for obj_id, rec_str in self._cur.fetchall():
+                    rung_index = obj_id - 1  # convert 1-based to 0-based
+                    if rung_index >= 0 and rec_str and rung_index not in rung_comments:
+                        rung_comments[rung_index] = rec_str
         except Exception:
             pass
 
@@ -2647,6 +3104,7 @@ class AoiBuilder(L5xElementBuilder):
 class ProgramBuilder(L5xElementBuilder):
     _data_types_map: Dict[str, "DataType"] = field(default_factory=dict)
     _redundancy_enabled: bool = field(default=False)
+    _value_types_map: Dict[str, "DataType"] = field(default_factory=dict)
 
     def build(self) -> Program:
         self._cur.execute(
@@ -2725,6 +3183,7 @@ class ProgramBuilder(L5xElementBuilder):
         for result in results:
             tag = TagBuilder(self._cur, result[1]).build()
             tag._data_types_map = self._data_types_map
+            tag._value_types_map = self._value_types_map
             tags.append(tag)
 
         self._cur.execute(
@@ -2861,6 +3320,8 @@ class ControllerBuilder(L5xElementBuilder):
     # Optional richer CIP-identity -> catalog-number table for resolving module
     # CatalogNumbers and the controller ProcessorType. None -> built-in only.
     _catalog_table: Union[Dict[Tuple[int, int, int], str], None] = None
+    # Type layouts from the project's TagInfo.XML (see taginfo_layouts).
+    _taginfo_layouts: Dict[str, "DataType"] = field(default_factory=dict)
 
     def build(self) -> Controller:
         self._cur.execute(
@@ -2990,6 +3451,7 @@ class ControllerBuilder(L5xElementBuilder):
         # data_types_map: case-insensitive name → DataType for all types (User + ProductDefined).
         # Used by Tag.to_xml() when generating Decorated XML.
         data_types_map: Dict[str, DataType] = all_data_types_map
+        value_types_map = merge_value_types(data_types_map, self._taginfo_layouts)
 
         # Get the Controller Scoped Tags
         self._cur.execute(
@@ -3011,6 +3473,7 @@ class ControllerBuilder(L5xElementBuilder):
             _tag_object_id = result[1]
             tag = TagBuilder(self._cur, _tag_object_id).build()
             tag._data_types_map = data_types_map
+            tag._value_types_map = value_types_map
             if (
                 (tag.data_type or tag.tag_type == "Alias")
                 and not tag.name.startswith("$")
@@ -3036,7 +3499,10 @@ class ControllerBuilder(L5xElementBuilder):
             _program_object_id = result[1]
             try:
                 programs.append(
-                    ProgramBuilder(self._cur, _program_object_id, data_types_map, redundancy_enabled).build()
+                    ProgramBuilder(
+                        self._cur, _program_object_id, data_types_map, redundancy_enabled,
+                        _value_types_map=value_types_map,
+                    ).build()
                 )
             except Exception as e:
                 # Observed on a real project file: one program's comps record
