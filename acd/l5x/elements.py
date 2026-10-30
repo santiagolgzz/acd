@@ -277,6 +277,11 @@ _PRIMITIVE_L5K_ZERO: Dict[str, str] = {
     "ULINT": "0",
     "REAL":  "0.00000000e+000",
     "LREAL": "0.00000000e+000",
+    "DT":    "0",
+    "LDT":   "0",
+    "TIME":  "0",
+    "LTIME": "0",
+    "TIME32": "0",
 }
 
 # Radix string used in Decorated DataValueMember for each numeric primitive.
@@ -292,6 +297,11 @@ _PRIMITIVE_RADIX: Dict[str, str] = {
     "ULINT": "Decimal",
     "REAL":  "Float",
     "LREAL": "Float",
+    "DT":    "Date/Time",
+    "LDT":   "Date/Time (ns)",
+    "TIME":  "Time (us)",
+    "LTIME": "LTime (ns)",
+    "TIME32": "Time32 (us)",
 }
 
 # Default zero value string for each primitive in Decorated output.
@@ -308,6 +318,11 @@ _PRIMITIVE_DECORATED_ZERO: Dict[str, str] = {
     "ULINT": "0",
     "REAL":  "0.0",
     "LREAL": "0.0",
+    "DT":    "DT#1970-01-01-00:00:00.000_000Z",
+    "LDT":   "LDT#1970-01-01-00:00:00.000_000_000Z",
+    "TIME":  "T#0us",
+    "LTIME": "LT#0ns",
+    "TIME32": "T32#0us",
 }
 
 # Built-in Logix struct types that are not in the user DataType list.
@@ -540,6 +555,16 @@ _PRIMITIVE_FORMAT: Dict[str, str] = {
     "SINT": "<b", "INT": "<h", "DINT": "<i", "LINT": "<q",
     "USINT": "<B", "UINT": "<H", "UDINT": "<I", "ULINT": "<Q",
     "REAL": "<f", "LREAL": "<d",
+    # Date and duration types are signed integer counts: DT and TIME of
+    # microseconds, LDT and LTIME of nanoseconds, TIME32 of microseconds.
+    "DT": "<q", "LDT": "<q", "TIME": "<q", "LTIME": "<q", "TIME32": "<i",
+}
+
+# Decorated spelling of the date and duration types: (prefix, ticks per
+# microsecond). DT/LDT count from 1970-01-01 UTC.
+_TIME_TYPES: Dict[str, Tuple[str, int]] = {
+    "DT": ("DT#", 1), "LDT": ("LDT#", 1000),
+    "TIME": ("T#", 1), "LTIME": ("LT#", 1000), "TIME32": ("T32#", 1),
 }
 
 # Control-word bit names of built-in structs, from bit 31 down. The DINT after
@@ -659,8 +684,72 @@ def _member_value_xml(member: "Member", raw: bytes,
     return f'<ArrayMember Name="{name}" DataType="{type_name}" Dimensions="{dim}">{elems}</ArrayMember>'
 
 
+def _format_time(dt_base: str, value: int) -> str:
+    """Decorated text of a DT, LDT, TIME, LTIME or TIME32 value."""
+    prefix, per_us = _TIME_TYPES[dt_base]
+    if dt_base in ("DT", "LDT"):
+        seconds, sub = divmod(value, 1_000_000 * per_us)
+        try:
+            stamp = datetime(1970, 1, 1) + timedelta(seconds=seconds)
+        except OverflowError:
+            return str(value)
+        digits = f"{sub:0{6 if per_us == 1 else 9}d}"
+        fraction = "_".join(digits[i : i + 3] for i in range(0, len(digits), 3))
+        return f"{prefix}{stamp:%Y-%m-%d-%H:%M:%S}.{fraction}Z"
+    # Durations: largest unit first, zero units left out (T#1h_30m).
+    sign, rest = ("-", -value) if value < 0 else ("", value)
+    units = [("d", 86_400_000_000), ("h", 3_600_000_000), ("m", 60_000_000),
+             ("s", 1_000_000), ("ms", 1_000), ("us", 1)]
+    if per_us == 1000:
+        units = [(u, n * 1000) for u, n in units] + [("ns", 1)]
+    parts = []
+    for unit, size in units:
+        count, rest = divmod(rest, size)
+        if count:
+            parts.append(f"{count}{unit}")
+    return prefix + sign + ("_".join(parts) or "0" + units[-1][0])
+
+
+def _group_digits(digits: str, size: int) -> str:
+    """Split digits into groups of size from the right, joined by '_'."""
+    head = len(digits) % size
+    groups = ([digits[:head]] if head else []) + [
+        digits[i : i + size] for i in range(head, len(digits), size)
+    ]
+    return "_".join(groups)
+
+
+def _radix_value(dt_base: str, radix: Union[str, None], raw: bytes) -> str:
+    """Decorated text of one atomic value in a tag's display radix.
+
+    Integers follow Logix's spellings: 16#0000_0000, 2#0000_..., 8#00_000_...
+    and ASCII as a quoted byte string, most significant byte first. Radixes
+    that do not apply to the type fall back to the type's default text.
+    """
+    if dt_base == "BOOL":
+        return str(raw[0] & 1)
+    if dt_base in _TIME_TYPES:
+        return _format_number(dt_base, raw, l5k=False)
+    if dt_base in ("REAL", "LREAL"):
+        return _format_number(dt_base, raw, l5k=radix == "Exponential")
+    value = struct.unpack(_PRIMITIVE_FORMAT[dt_base], raw)[0]
+    bits = len(raw) * 8
+    unsigned = value & ((1 << bits) - 1)
+    if radix == "Hex":
+        return "16#" + _group_digits(f"{unsigned:0{bits // 4}x}", 4)
+    if radix == "Binary":
+        return "2#" + _group_digits(f"{unsigned:0{bits}b}", 4)
+    if radix == "Octal":
+        return "8#" + _group_digits(f"{unsigned:0{(bits + 2) // 3}o}", 3)
+    if radix == "ASCII":
+        return _logix_string(raw[::-1])
+    return str(value)
+
+
 def _format_number(dt_base: str, raw: bytes, l5k: bool) -> str:
     value = struct.unpack(_PRIMITIVE_FORMAT[dt_base], raw)[0]
+    if dt_base in _TIME_TYPES:
+        return str(value) if l5k else _format_time(dt_base, value)
     if dt_base not in ("REAL", "LREAL"):
         return str(value)
     if l5k:
@@ -880,6 +969,24 @@ class Tag(L5xElement):
                 parts.append(f"&#x{cp:04X};")
         return "".join(parts)
 
+    def _data_value_xml(self, dt_base: str) -> str:
+        """<Data Format="Decorated"> with the scalar atomic value in the tag's radix.
+
+        The stored value is used when it decodes, otherwise zero (the L5K default).
+        """
+        size = 1 if dt_base == "BOOL" else _element_size(dt_base)
+        if size is None:
+            return ""
+        data = self._data or b""
+        raw = data[:size] if _l5k_from_data(dt_base, data) is not None else bytes(size)
+        radix = self.radix or _PRIMITIVE_RADIX.get(dt_base, "Decimal")
+        value = _radix_value(dt_base, radix, raw)
+        type_name = self.data_type.split("[")[0] if self.data_type else dt_base
+        return (
+            f'<Data Format="Decorated">\n<DataValue DataType="{_escape_xml_attr(type_name)}" '
+            f'Radix="{_escape_xml_attr(radix)}" Value="{_escape_xml_attr(value)}"/>\n</Data>'
+        )
+
     def to_xml(self) -> str:
         base = super().to_xml()
 
@@ -903,6 +1010,8 @@ class Tag(L5xElement):
         if l5k_zero is not None and self._data and not self.alias_for:
             l5k_zero = _l5k_from_data(dt_base, self._data) or l5k_zero
         data_xml = f'<Data Format="L5K">\n{l5k_zero}\n</Data>' if l5k_zero is not None else ""
+        if l5k_zero is not None and not self.alias_for:
+            data_xml += self._data_value_xml(dt_base)
 
         if not data_xml and self._data and not self.alias_for:
             data_xml = (
@@ -1476,8 +1585,13 @@ def radix_enum(i: int) -> str:
         return "Date/Time"
     if i == 11:
         return "Date/Time (ns)"
+    # 12-14 seen on TIME32, TIME and LTIME tags (ACDTestsWithAOI reference).
     if i == 12:
-        return "UseTypeStyle"
+        return "Time32 (us)"
+    if i == 13:
+        return "Time (us)"
+    if i == 14:
+        return "LTime (ns)"
     return "General"
 
 
