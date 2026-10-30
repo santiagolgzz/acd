@@ -1671,11 +1671,17 @@ class DataTypeBuilder(L5xElementBuilder):
                 extended_record.value
             )
 
-        string_family_int = struct.unpack("<I", extended_records[0x6C])[0]
+        def attribute_u32(attribute_id: int) -> int:
+            # Stub records (e.g. a legacy AOI's type entry) carry only some
+            # attributes; a missing one reads as 0.
+            value = extended_records.get(attribute_id, b"")
+            return struct.unpack("<I", value)[0] if len(value) == 4 else 0
+
+        string_family_int = attribute_u32(0x6C)
         string_family = "StringFamily" if string_family_int == 1 else "NoFamily"
 
-        built_in = struct.unpack("<I", extended_records[0x67])[0]
-        module_defined = struct.unpack("<I", extended_records[0x69])[0]
+        built_in = attribute_u32(0x67)
+        module_defined = attribute_u32(0x69)
 
         class_type = "User"
         if module_defined > 0:

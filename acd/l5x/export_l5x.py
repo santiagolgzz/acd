@@ -1,9 +1,11 @@
 import argparse
 import os
 import re
+import shutil
 import sqlite3
 import struct
 import tempfile
+import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
 from sqlite3 import Cursor
@@ -30,14 +32,11 @@ from acd.record.sbregion import SbRegionRecord
 @dataclass
 class ExportL5x:
     input_filename: os.PathLike
-    # Default to a unique temp dir per ExportL5x instance. The original default
-    # was the shared relative dir "build", which made concurrent/parallel test
-    # runs collide on build/acd.db (Windows locks the SQLite file while a
-    # connection is open, so a second run's os.remove in __post_init__ fails).
-    # tempfile.mkdtemp() was the documented intent (see the original comment);
-    # each instance now gets its own dir so runs are isolated. Pass a specific
-    # dir (e.g. "build") to restore the old behaviour for manual inspection.
-    _temp_dir: str = field(default_factory=lambda: tempfile.mkdtemp(prefix="acd-build-"))
+    # Directory for the extracted files and SQLite database. None (default)
+    # creates a unique temp dir per instance, removed when the instance is
+    # garbage-collected or the interpreter exits, even after an error. Pass a
+    # specific dir (e.g. "build") to keep the files for inspection.
+    _temp_dir: Union[str, None] = None
     _controller: Union[Controller, None] = None
     _project: Union[RSLogix5000Content, None] = None
     # Optional richer catalog (CIP identity -> catalog number) used to resolve
@@ -49,6 +48,9 @@ class ExportL5x:
     _catalog_table: Union[Dict[Tuple[int, int, int], str], None] = None
 
     def __post_init__(self):
+        if self._temp_dir is None:
+            self._temp_dir = tempfile.mkdtemp(prefix="acd-build-")
+            weakref.finalize(self, shutil.rmtree, self._temp_dir, True)
         log.info(
             "Creating temporary directory (if it doesn't exist to store ACD database files - "
             + self._temp_dir
@@ -135,9 +137,14 @@ class ExportL5x:
             and struct.unpack_from("<I", bytes(record.record.record_buffer), 0x0C)[0] != 0
         )
         self._legacy_layout = legacy_records * 2 > len(comps_db.records.record)
+        # Every Region Map record seen; a file can hold stale copies that fail
+        # validation, so populate_region_map tries them all.
+        self._region_map_candidates: List[bytes] = []
         for record in comps_db.records.record:
             t = CompsRecord.parse(record)
             if t is not None:
+                if t[1] == 0 and t[2] == "Region Map":
+                    self._region_map_candidates.append(bytes(t[5]))
                 oid = t[0]
                 if oid not in comps_by_id or len(t[5]) > len(comps_by_id[oid][5]):
                     comps_by_id[oid] = t
@@ -237,18 +244,24 @@ class ExportL5x:
         return self._project
 
     def populate_region_map(self):
-        self._cur.execute(
-            "SELECT comp_name, object_id, parent_id, record FROM comps WHERE parent_id=0 AND comp_name='Region Map'"
-        )
-        results = self._cur.fetchall()
-
-        if len(results) == 0:
+        # Use the largest Region Map record that parses; fall back to the
+        # largest one's error if none does.
+        candidates = sorted(self._region_map_candidates, key=len, reverse=True)
+        if not candidates:
             return
-        record = results[0][3]
+        entries, first_error = None, None
+        for record in candidates:
+            try:
+                entries = self._parse_region_map(record)
+                break
+            except ValueError as error:
+                first_error = first_error or error
+        if entries is None:
+            raise first_error
 
         self._cur.executemany(
             "INSERT INTO region_map VALUES (?, ?, ?, ?, ?)",
-            self._parse_region_map(record),
+            entries,
         )
         self._db.commit()
 
