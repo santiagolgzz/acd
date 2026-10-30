@@ -76,9 +76,9 @@ class CompsRecord:
                 # Legacy FAFA lengths stop four bytes before the physical
                 # record. Those bytes contain the end of the final Rx
                 # attribute, so retain them when that exact trailer exists.
-                if record_name == "Region Map" and payload_end + 4 <= len(raw):
-                    payload_end += 4
-                elif payload_end + 4 == len(raw):
+                # The physical record can also be longer than that (other
+                # data follows), so keep the four bytes whenever they exist.
+                if payload_end + 4 <= len(raw):
                     payload_end += 4
             else:
                 payload_start = 0x97
