@@ -134,3 +134,58 @@ def test_decorated_udt_value():
     assert '<StructureMember Name="Delay" DataType="TIMER">' in xml
     assert 'Name="PRE" DataType="DINT" Radix="Decimal" Value="500"' in xml
     assert "ZZZZZZZZZZSeat0" not in xml
+
+
+def _dat(buf: bytes):
+    from types import SimpleNamespace
+    return SimpleNamespace(identifier=64250, record=SimpleNamespace(record_buffer=buf))
+
+
+def test_legacy_rung_comment_record():
+    from acd.record.comments import CommentsRecord
+
+    text = "Step one\r\nStep two".encode("utf-16-le") + b"\0\0"
+    body = struct.pack("<HHIII", 7, 1, 0x5E6F0068, 0x1A2B006D, 0x4321FFEC) + bytes(9) + text
+    buf = struct.pack("<I", len(body) + 4) + body
+    entry = CommentsRecord.parse_legacy(_dat(buf))
+    assert entry[3] == "Step one\r\nStep two"
+    assert (entry[4], entry[5], entry[7], entry[8]) == (1, 0x5E6F0068, 0x4321FFEC, 0x1A2B006D)
+
+
+def test_legacy_bit_comment_record():
+    from acd.record.comments import CommentsRecord
+
+    body = (
+        struct.pack("<HHIII", 3, 3, 0x2B3C0068, 0x7A8B006B, 0)
+        + struct.pack("<I", 0x0100) + bytes(3)
+        + ".0".encode("utf-16-le") + b"\0\0"
+        + "Bit zero note".encode("utf-16-le") + b"\0\0"
+    )
+    entry = CommentsRecord.parse_legacy(_dat(struct.pack("<I", len(body) + 4) + body))
+    assert (entry[3], entry[6], entry[8]) == ("Bit zero note", ".0", 0x7A8B006B)
+
+
+def test_taginfo_layouts():
+    from acd.l5x.elements import taginfo_layouts
+
+    xml = (
+        '<LogixTagInfo><DataTypes><DataType Name="Seat" Size="12"><Members>'
+        '<Member Name="ZZZZZZZZZZSeat0" DataType="SINT" Offset="0" Hidden="true"/>'
+        '<Member Name="Extend" DataType="BOOL" Offset="0" Bit="1"/>'
+        '<Member Name="Pos" DataType="REAL" Offset="4"><Dimensions><Dim Size="2"/></Dimensions></Member>'
+        '</Members></DataType></DataTypes></LogixTagInfo>'
+    )
+    seat = taginfo_layouts(xml)["SEAT"]
+    assert seat._size == 12
+    extend, pos = seat.members[1], seat.members[2]
+    assert (extend._offset, extend._bit, extend.hidden) == (0, 1, False)
+    assert (pos.data_type, pos.dimension, pos._offset) == ("REAL", 2, 4)
+    data = bytes([0b10, 0, 0, 0]) + struct.pack("<ff", 1.5, 2.0)
+    xml_out = _decorated_from_data("SEAT", None, data, taginfo_layouts(xml))
+    assert 'Name="Extend" DataType="BOOL" Value="1"' in xml_out
+    assert '<Element Index="[1]" Value="2.0"/>' in xml_out
+
+
+def test_nonfinite_real():
+    assert _l5k_from_data("REAL", struct.pack("<f", float("nan"))) == "1.#QNAN000e+000"
+    assert _l5k_from_data("REAL", struct.pack("<f", float("-inf"))) == "-1.#INF0000e+000"

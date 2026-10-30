@@ -1,4 +1,5 @@
 import html
+import math
 import os
 import re
 import shutil
@@ -644,6 +645,10 @@ def _format_number(dt_base: str, raw: bytes, l5k: bool) -> str:
     value = struct.unpack(_PRIMITIVE_FORMAT[dt_base], raw)[0]
     if dt_base not in ("REAL", "LREAL"):
         return str(value)
+    if math.isnan(value) or math.isinf(value):
+        # Logix spells non-finite floats the way the MSVC runtime prints them.
+        text = "1.#QNAN" if math.isnan(value) else ("-1.#INF" if value < 0 else "1.#INF")
+        return text + ("000e+000" if text.endswith("NAN") else "0000e+000") if l5k else text
     if l5k:
         # L5K writes floats as 0.00000000e+000 (three exponent digits).
         mantissa, exponent = f"{value:.8e}".split("e")
@@ -776,6 +781,50 @@ def _decorated_from_data(dt_base: str, dimensions: Union[str, None], data: bytes
     return f'<Data Format="Decorated">\n<Array {attrs}>{"".join(elements)}</Array>\n</Data>'
 
 
+def taginfo_layouts(xml_text: str) -> Dict[str, "DataType"]:
+    """Type layouts (size, member offsets and bits) from a project's TagInfo.XML.
+
+    TagInfo.XML lists every type the project uses, including Add-On
+    Instructions and module-defined types, with byte offsets. Only the
+    layout is kept; it is used to decode stored tag values, not exported.
+    """
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return {}
+    layouts: Dict[str, DataType] = {}
+    for dt in root.iter("DataType"):
+        members = []
+        for m in dt.findall("Members/Member"):
+            dims = [int(d.get("Size", "0")) for d in m.findall("Dimensions/Dim")]
+            dim = 1
+            for d in dims:
+                dim *= d
+            bit = m.get("Bit")
+            members.append(Member(
+                m.get("Name"), m.get("Name"), m.get("DataType", ""), dim if dims else 0,
+                "Decimal", m.get("Hidden") == "true", None,
+                int(bit) if bit is not None else None, "Read/Write",
+                _offset=int(m.get("Offset", "0")), _bit=int(bit) if bit is not None else 0,
+            ))
+        name = dt.get("Name", "")
+        layouts[name.upper()] = DataType(
+            name, name, "NoFamily", "User", members, _size=int(dt.get("Size", "0"))
+        )
+    return layouts
+
+
+def merge_value_types(data_types_map: Dict[str, "DataType"],
+                      taginfo: Dict[str, "DataType"]) -> Dict[str, "DataType"]:
+    """Types for value decoding: the Comps-derived type where it has a size
+    and members, otherwise the TagInfo.XML layout."""
+    merged = dict(taginfo)
+    for key, dt in data_types_map.items():
+        if dt._size and dt.members:
+            merged[key] = dt
+    return merged
+
+
 @dataclass
 class ProduceInfo(L5xElement):
     produce_count: str
@@ -826,6 +875,9 @@ class Tag(L5xElement):
     consume_info: Union[ConsumeInfo, None] = None
     # Raw stored value from the tag's data object; None when not found.
     _data: Union[bytes, None] = None
+    # Type layouts used to decode _data (see value_types_map); falls back to
+    # _data_types_map when empty.
+    _value_types_map: Dict[str, "DataType"] = field(default_factory=dict)
 
     @property
     def _l5x_exclude(self) -> bool:
@@ -869,6 +921,22 @@ class Tag(L5xElement):
         desc = self._sanitize_xml_text(desc_raw) if desc_raw else None
         desc_xml = f'<Description>\n<![CDATA[{desc}]]>\n</Description>' if desc else ""
 
+        # --- Comments child element: per-bit / per-member descriptions ---
+        # Stored tag_references omit the leading "." in current files (".2"
+        # is stored as "2"); references starting with "!" are not operands.
+        operand_comments: Dict[str, str] = {}
+        for ref, text in self._comments:
+            if not ref or ref == "." or ref.startswith("!") or not text:
+                continue
+            operand = ref if ref[0] in ".[" else "." + ref
+            operand_comments.setdefault(operand.upper(), text)
+        if operand_comments:
+            desc_xml += "<Comments>" + "".join(
+                f'<Comment Operand="{_escape_xml_attr(operand)}">\n'
+                f'<![CDATA[{self._sanitize_xml_text(text)}]]>\n</Comment>'
+                for operand, text in operand_comments.items()
+            ) + "</Comments>"
+
         # --- Data child element(s) ---
         # Scalar primitives get Format="L5K" only.
         # Scalar STRING gets Format="L5K" (the L5K encoder handles it separately; we emit
@@ -882,7 +950,9 @@ class Tag(L5xElement):
 
         if not data_xml and self._data and not self.alias_for:
             data_xml = (
-                _decorated_from_data(dt_base, self.dimensions, self._data, self._data_types_map) or ""
+                _decorated_from_data(
+                    dt_base, self.dimensions, self._data, self._value_types_map or self._data_types_map
+                ) or ""
             )
 
         if not data_xml and dt_base not in _SKIP_DECORATED and dt_base != "STRING":
@@ -2235,10 +2305,16 @@ class TagBuilder(L5xElementBuilder):
     def build(self) -> Tag:
         tag = self._build()
         # Attach the stored value bytes from the tag's data object, if any.
+        # Current layout: data_table_instance is the data object's id. Legacy
+        # layout: data_table_instance is a data-table address and the data
+        # object's id is the record's first u32 (data_instance_id).
         try:
-            self._cur.execute(
-                "SELECT data FROM tag_data WHERE object_id=?", (tag._data_table_instance,)
-            )
+            data_object_id = tag._data_table_instance
+            self._cur.execute("SELECT record FROM comps WHERE object_id=?", (self._object_id,))
+            rec = self._cur.fetchone()
+            if rec and isinstance(RxGeneric.from_bytes(rec[0]), LegacyRxGeneric):
+                data_object_id = struct.unpack_from("<I", bytes(rec[0]), 0)[0]
+            self._cur.execute("SELECT data FROM tag_data WHERE object_id=?", (data_object_id,))
             row = self._cur.fetchone()
         except Exception:
             row = None
@@ -2276,15 +2352,23 @@ class TagBuilder(L5xElementBuilder):
                 results[0][0], results[0][0], "Base", "", None, external_access, constant, None, 0, []
             )
 
-        scope_key, member_key = (
-            (0, 0) if isinstance(r, LegacyRxGeneric) else scoped_comment_keys(raw_rec)
-        )
+        if isinstance(r, LegacyRxGeneric):
+            # Program tags: (program, tag); controller tags: (tag, 0).
+            scope_key, member_key = _legacy_comment_keys(self._cur, self._object_id)
+        else:
+            scope_key, member_key = scoped_comment_keys(raw_rec)
         if member_key:
             # Program tag: only the comments filed under this tag's own key,
             # not every comment in the program's scope.
             self._cur.execute(
                 "SELECT tag_reference, record_string FROM comments WHERE parent=? AND member_ref=?",
                 (scope_key, member_key),
+            )
+        elif isinstance(r, LegacyRxGeneric):
+            # Controller tag: comments filed under the tag's own key.
+            self._cur.execute(
+                "SELECT tag_reference, record_string FROM comments WHERE parent=? AND member_ref=0",
+                (scope_key,),
             )
         else:
             self._cur.execute(
@@ -2639,6 +2723,19 @@ def scoped_comment_keys(raw: bytes) -> Tuple[int, int]:
     return (scope_cid * 0x10000) + scope_cip, member_key
 
 
+def _legacy_comment_keys(cur: Cursor, object_id: int) -> Tuple[int, int]:
+    """(scope key, member key) of a legacy-layout object, from the comment_keys
+    table ExportL5x fills from the record header; (0, 0) if unknown."""
+    try:
+        cur.execute(
+            "SELECT scope_key, member_key FROM comment_keys WHERE object_id=?", (object_id,)
+        )
+        row = cur.fetchone()
+    except Exception:
+        row = None
+    return (row[0], row[1]) if row else (0, 0)
+
+
 @dataclass
 class RoutineBuilder(L5xElementBuilder):
     def build(self) -> Routine:
@@ -2701,9 +2798,10 @@ class RoutineBuilder(L5xElementBuilder):
         # have rung_content=0).
         rung_comments: Dict[int, str] = {}
         try:
-            scope_key, member_key = (
-                (0, 0) if isinstance(r, LegacyRxGeneric) else scoped_comment_keys(record)
-            )
+            if isinstance(r, LegacyRxGeneric):
+                scope_key, member_key = _legacy_comment_keys(self._cur, self._object_id)
+            else:
+                scope_key, member_key = scoped_comment_keys(record)
             if member_key:
                 # Rung comments sit in the program's comment scope with
                 # member_ref = the routine's own key, and the high half of
@@ -2967,6 +3065,7 @@ class AoiBuilder(L5xElementBuilder):
 class ProgramBuilder(L5xElementBuilder):
     _data_types_map: Dict[str, "DataType"] = field(default_factory=dict)
     _redundancy_enabled: bool = field(default=False)
+    _value_types_map: Dict[str, "DataType"] = field(default_factory=dict)
 
     def build(self) -> Program:
         self._cur.execute(
@@ -3045,6 +3144,7 @@ class ProgramBuilder(L5xElementBuilder):
         for result in results:
             tag = TagBuilder(self._cur, result[1]).build()
             tag._data_types_map = self._data_types_map
+            tag._value_types_map = self._value_types_map
             tags.append(tag)
 
         self._cur.execute(
@@ -3163,6 +3263,8 @@ class ControllerBuilder(L5xElementBuilder):
     # Optional richer CIP-identity -> catalog-number table for resolving module
     # CatalogNumbers and the controller ProcessorType. None -> built-in only.
     _catalog_table: Union[Dict[Tuple[int, int, int], str], None] = None
+    # Type layouts from the project's TagInfo.XML (see taginfo_layouts).
+    _taginfo_layouts: Dict[str, "DataType"] = field(default_factory=dict)
 
     def build(self) -> Controller:
         self._cur.execute(
@@ -3292,6 +3394,7 @@ class ControllerBuilder(L5xElementBuilder):
         # data_types_map: case-insensitive name → DataType for all types (User + ProductDefined).
         # Used by Tag.to_xml() when generating Decorated XML.
         data_types_map: Dict[str, DataType] = all_data_types_map
+        value_types_map = merge_value_types(data_types_map, self._taginfo_layouts)
 
         # Get the Controller Scoped Tags
         self._cur.execute(
@@ -3313,6 +3416,7 @@ class ControllerBuilder(L5xElementBuilder):
             _tag_object_id = result[1]
             tag = TagBuilder(self._cur, _tag_object_id).build()
             tag._data_types_map = data_types_map
+            tag._value_types_map = value_types_map
             if (
                 (tag.data_type or tag.tag_type == "Alias")
                 and not tag.name.startswith("$")
@@ -3337,7 +3441,10 @@ class ControllerBuilder(L5xElementBuilder):
         for result in program_records:
             _program_object_id = result[1]
             programs.append(
-                ProgramBuilder(self._cur, _program_object_id, data_types_map, redundancy_enabled).build()
+                ProgramBuilder(
+                    self._cur, _program_object_id, data_types_map, redundancy_enabled,
+                    _value_types_map=value_types_map,
+                ).build()
             )
 
         # Build task schedule ID → program name map. Legacy projects keep this

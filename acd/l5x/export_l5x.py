@@ -1,5 +1,6 @@
 import argparse
 import os
+import re
 import sqlite3
 import struct
 import tempfile
@@ -18,6 +19,7 @@ from acd.l5x.elements import (
     ControllerBuilder,
     ProjectBuilder,
     RSLogix5000Content,
+    taginfo_layouts,
 )
 from acd.record.comments import CommentsRecord
 from acd.record.comps import CompsRecord
@@ -80,6 +82,8 @@ class ExportL5x:
         self._cur.execute(
             "CREATE TABLE region_map(object_id int, parent_id int, unknown int, seq_no int, record BLOB NOT NULL)"
         )
+        log.debug("Create Comment_keys table in sqllite db")
+        self._cur.execute("CREATE TABLE comment_keys(object_id int, scope_key int, member_key int)")
         log.debug("Create Tag_data table in sqllite db")
         self._cur.execute("CREATE TABLE tag_data(object_id int, data BLOB NOT NULL)")
         log.debug("Create Rung_uids table in sqllite db")
@@ -120,6 +124,17 @@ class ExportL5x:
         # correctly with RxGeneric. The full record is always the largest one.
         comps_by_id = {}
         data_by_id = {}
+        keys_by_id = {}
+        # Projects saved by v20 and earlier use the legacy Comps layout (see
+        # CompsRecord.parse); their Comments.Dat uses a legacy layout too.
+        legacy_records = sum(
+            1
+            for record in comps_db.records.record
+            if record.identifier == 64250
+            and len(bytes(record.record.record_buffer)) >= 0x10
+            and struct.unpack_from("<I", bytes(record.record.record_buffer), 0x0C)[0] != 0
+        )
+        self._legacy_layout = legacy_records * 2 > len(comps_db.records.record)
         for record in comps_db.records.record:
             t = CompsRecord.parse(record)
             if t is not None:
@@ -127,7 +142,12 @@ class ExportL5x:
                 if oid not in comps_by_id or len(t[5]) > len(comps_by_id[oid][5]):
                     comps_by_id[oid] = t
                     data_by_id[oid] = CompsRecord.data_value(record)
+                    keys_by_id[oid] = CompsRecord.legacy_comment_keys(record)
         self._cur.executemany("INSERT INTO comps VALUES (?,?,?,?,?,?)", comps_by_id.values())
+        self._cur.executemany(
+            "INSERT INTO comment_keys VALUES (?,?,?)",
+            [(oid, *keys) for oid, keys in keys_by_id.items() if keys is not None],
+        )
         self._cur.executemany(
             "INSERT INTO tag_data VALUES (?,?)",
             [(oid, data) for oid, data in data_by_id.items() if data is not None],
@@ -157,7 +177,8 @@ class ExportL5x:
             "Getting records from ACD Comments file and storing in sqllite database"
         )
         comments_db = DbExtract(os.path.join(self._temp_dir, "Comments.Dat")).read()
-        comment_tuples = [t for record in comments_db.records.record if (t := CommentsRecord.parse(record)) is not None]
+        parse_comment = CommentsRecord.parse_legacy if self._legacy_layout else CommentsRecord.parse
+        comment_tuples = [t for record in comments_db.records.record if (t := parse_comment(record)) is not None]
         self._cur.executemany("INSERT INTO comments VALUES (?,?,?,?,?,?,?,?,?)", comment_tuples)
         self._db.commit()
 
@@ -177,14 +198,28 @@ class ExportL5x:
         self._cur.execute("CREATE INDEX idx_region_map_parent_id ON region_map(parent_id)")
         self._cur.execute("CREATE INDEX idx_rung_uids_parent_id ON rung_uids(parent_id)")
         self._cur.execute("CREATE INDEX idx_tag_data_object_id ON tag_data(object_id)")
+        self._cur.execute("CREATE INDEX idx_comment_keys_object_id ON comment_keys(object_id)")
         self._cur.execute("CREATE INDEX idx_comments_parent ON comments(parent)")
         self._db.commit()
+
+    def _taginfo_layouts(self):
+        path = os.path.join(self._temp_dir, "TagInfo.XML")
+        if not os.path.exists(path):
+            return {}
+        with open(path, "rb") as f:
+            raw = f.read()
+        encoding = "utf-16" if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else "utf-8-sig"
+        text = raw.decode(encoding, errors="replace")
+        # ElementTree rejects an encoding declaration on an already-decoded str.
+        text = re.sub(r"^<\?xml[^>]*\?>", "", text.lstrip())
+        return taginfo_layouts(text)
 
     @property
     def controller(self):
         if self._controller is None:
             self._controller = ControllerBuilder(
-                self._cur, _catalog_table=self._catalog_table
+                self._cur, _catalog_table=self._catalog_table,
+                _taginfo_layouts=self._taginfo_layouts(),
             ).build()
         return self._controller
 
