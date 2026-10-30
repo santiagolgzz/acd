@@ -2655,9 +2655,14 @@ class RoutineBuilder(L5xElementBuilder):
 
         record = results[0][3]
         name = results[0][0]
-        routine_type = routine_type_enum(
-            struct.unpack_from("<H", r.record_buffer, 0x30)[0]
-        )
+        # The routine type follows the routine's cip_type (0x6D) in both
+        # layouts: at 0x30 of the main record in current files, at raw offset
+        # 0x0C (right after cip_type at 0x08) in the legacy layout.
+        if isinstance(r, LegacyRxGeneric):
+            type_index = struct.unpack_from("<H", bytes(record), 0x0C)[0]
+        else:
+            type_index = struct.unpack_from("<H", r.record_buffer, 0x30)[0]
+        routine_type = routine_type_enum(type_index)
 
         self._cur.execute(
             "SELECT rm.object_id, r.rung FROM region_map rm "
