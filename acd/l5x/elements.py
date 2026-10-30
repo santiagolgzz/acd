@@ -2242,15 +2242,15 @@ class TagBuilder(L5xElementBuilder):
         }
         return atomic_types.get(record.main_record.runtime_type & 0xFF, "")
 
-    def _legacy_alias_for(self, value: bytes) -> str:
-        # Usually null-terminated (a trailing b"\x00\x00" utf-16 code unit),
+    def _resolve_alias_path(self, value: bytes) -> str:
+        # A UTF-16 path of @<object id>@ references. Usually null-terminated,
         # but observed on real project files without one -- a path ending in
         # a literal ".<member/bit>" reference (e.g. an alias into a bit or an
         # array/structure member) can occupy the field's full length with no
         # terminator at all. The length just needs to be a whole number of
         # utf-16 code units; a missing terminator isn't itself invalid.
         if len(value) % 2:
-            raise ValueError("Invalid legacy alias path")
+            raise ValueError("Invalid alias path")
         path = value.decode("utf-16-le").rstrip("\x00")
 
         def replace_object_id(match):
@@ -2261,7 +2261,7 @@ class TagBuilder(L5xElementBuilder):
             )
             row = self._cur.fetchone()
             if not row:
-                raise ValueError("Legacy alias target does not exist")
+                raise ValueError("Alias target does not exist")
             try:
                 target = RxGeneric.from_bytes(row[1])
                 logical_name = getattr(target, "logical_name", "")
@@ -2269,12 +2269,27 @@ class TagBuilder(L5xElementBuilder):
                     return logical_name
             except Exception:
                 pass
-            return row[0]
+            return self._module_tag_name(row[0])
 
         resolved = re.sub(r"@([0-9a-fA-F]{8})@", replace_object_id, path)
         if re.search(r"@[0-9a-fA-F]{8}@", resolved):
-            raise ValueError("Legacy alias target could not be resolved")
+            raise ValueError("Alias target could not be resolved")
         return resolved
+
+    def _module_tag_name(self, comp_name: str) -> str:
+        # Current-layout module tags are named "&<module object id>:2:O";
+        # Rockwell writes the module's name there ("Local:2:O").
+        match = re.match(r"&([0-9a-fA-F]{8}):", comp_name)
+        if not match:
+            return comp_name
+        self._cur.execute(
+            "SELECT comp_name FROM comps WHERE object_id=?",
+            (int(match.group(1), 16),),
+        )
+        row = self._cur.fetchone()
+        if not row:
+            raise ValueError("Alias target module does not exist")
+        return row[0] + comp_name[match.end() - 1 :]
 
     def build(self) -> Tag:
         tag = self._build()
@@ -2378,7 +2393,7 @@ class TagBuilder(L5xElementBuilder):
                     None,
                     r.main_record.data_table_instance,
                     comment_results,
-                    alias_for=self._legacy_alias_for(extended_records[0x65]),
+                    alias_for=self._resolve_alias_path(extended_records[0x65]),
                 )
 
             data_type = self._legacy_data_type(r)
@@ -2458,44 +2473,52 @@ class TagBuilder(L5xElementBuilder):
             data_type_results = self._cur.fetchall()
             data_type = data_type_results[0][0] if data_type_results else ""
 
-        if 0x01 not in extended_records:
-            # Name comes from comp_name in the database; radix from main_record
-            raw_radix = r.main_record.radix
-            radix = radix_enum(raw_radix)
-            dim_parts = []
-            if r.main_record.dimension_1 != 0:
-                dim_parts.append(str(r.main_record.dimension_1))
-            if r.main_record.dimension_2 != 0:
-                dim_parts.append(str(r.main_record.dimension_2))
-            if r.main_record.dimension_3 != 0:
-                dim_parts.append(str(r.main_record.dimension_3))
-            dimensions = ",".join(dim_parts) if dim_parts else None
+        # The name is in ext[0x01] (u16 length, then utf-8), else comp_name.
+        name = results[0][0]
+        if len(extended_records.get(0x01, b"")) >= 2:
+            name_length = struct.unpack("<H", extended_records[0x01][0:2])[0]
+            name = extended_records[0x01][2 : name_length + 2].decode("utf-8", errors="replace")
+        alias_for = None
+        if 0x65 in extended_records:
+            # Current-layout alias tags keep the same @<object id>@ path as
+            # legacy ones, in attribute 0x65.
+            try:
+                alias_for = self._resolve_alias_path(extended_records[0x65])
+            except ValueError as e:
+                log.warning(
+                    f"Tag '{name}': couldn't resolve its alias target ({e}) -- "
+                    "exporting it as a Base tag instead"
+                )
+        if alias_for:
             return Tag(
-                results[0][0], results[0][0], "Base", data_type, radix,
-                external_access, constant, dimensions, r.main_record.data_table_instance,
+                name,
+                name,
+                "Alias",
+                None,
+                radix_enum(r.main_record.radix),
+                external_access,
+                None,
+                None,
+                r.main_record.data_table_instance,
                 comment_results,
+                alias_for=alias_for,
             )
 
-        name_length = struct.unpack("<H", extended_records[0x01][0:2])[0]
-        name = bytes(extended_records[0x01][2 : name_length + 2]).decode("utf-8", errors="replace")
-
-        raw_radix = r.main_record.radix
-        radix = radix_enum(raw_radix)
-
-        dim_parts = []
-        if r.main_record.dimension_1 != 0:
-            dim_parts.append(str(r.main_record.dimension_1))
-        if r.main_record.dimension_2 != 0:
-            dim_parts.append(str(r.main_record.dimension_2))
-        if r.main_record.dimension_3 != 0:
-            dim_parts.append(str(r.main_record.dimension_3))
-        dimensions = ",".join(dim_parts) if dim_parts else None
+        dimensions = ",".join(
+            str(dimension)
+            for dimension in (
+                r.main_record.dimension_1,
+                r.main_record.dimension_2,
+                r.main_record.dimension_3,
+            )
+            if dimension
+        ) or None
         return Tag(
             name,
             name,
             "Base",
             data_type,
-            radix,
+            radix_enum(r.main_record.radix),
             external_access,
             constant,
             dimensions,

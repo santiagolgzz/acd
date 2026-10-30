@@ -202,3 +202,101 @@ def test_decorated_udt_value():
     assert '<StructureMember Name="Delay" DataType="TIMER">' in xml
     assert 'Name="PRE" DataType="DINT" Radix="Decimal" Value="500"' in xml
     assert "ZZZZZZZZZZSeat0" not in xml
+
+
+def test_current_alias_path_read_past_declared_length():
+    from acd.record.comps import CompsRecord
+    from acd.record.rx import RxGeneric
+
+    path = "@0a0b0c0d@.@01020304@.7\0".encode("utf-16-le")
+    payload = bytearray(82)
+    struct.pack_into("<H", payload, 10, 0x6B)
+    payload += struct.pack("<II", 0x01, 2) + b"\0\0"
+    payload += struct.pack("<II", 0x65, len(path)) + path
+    # The stored attribute length leaves out the last four bytes.
+    struct.pack_into("<II", payload, 74, len(payload) - 78, 2)
+    raw = bytearray(148) + payload
+    # The declared length stops four bytes short of the physical record.
+    struct.pack_into("<I", raw, 0, len(raw) - 4)
+    entry = CompsRecord.parse(_dat(bytes(raw)))
+    assert entry is not None
+    attributes = {a.attribute_id: bytes(a.value) for a in RxGeneric.from_bytes(entry[5]).extended_records}
+    assert attributes[0x65] == path
+
+
+def test_current_alias_resolves_module_tag_names():
+    import sqlite3
+
+    import pytest
+
+    from acd.l5x.elements import TagBuilder
+
+    db = sqlite3.connect(":memory:")
+    cur = db.cursor()
+    cur.execute("CREATE TABLE comps(object_id int, parent_id int, comp_name text,"
+                " seq_number int, record_type int, record BLOB)")
+    rows = [(0x11223344, "Rack7"), (0x0A0B0C0D, "&11223344:5:O"), (0x01020304, "Data")]
+    for object_id, name in rows:
+        cur.execute("INSERT INTO comps VALUES (?, 0, ?, 0, 0, ?)", (object_id, name, b""))
+    path = "@0a0b0c0d@.@01020304@.7\0".encode("utf-16-le")
+    assert TagBuilder(cur, 99)._resolve_alias_path(path) == "Rack7:5:O.Data.7"
+
+    # An unresolvable target raises; the builder then exports a Base tag.
+    with pytest.raises(ValueError):
+        TagBuilder(cur, 97)._resolve_alias_path("@0f0f0f0f@\0".encode("utf-16-le"))
+
+
+def _current_tag_record(name: str, alias_path=None) -> bytes:
+    from .rx_fixtures import rx_record
+
+    encoded = name.encode("utf-8")
+    attributes = struct.pack("<II", 0x01, 2 + len(encoded)) + struct.pack("<H", len(encoded)) + encoded
+    count = 1
+    if alias_path is not None:
+        attributes += struct.pack("<II", 0x65, len(alias_path)) + alias_path
+        count = 2
+    return rx_record(0x6B, 0x0123, attributes, count, length_extra=8)
+
+
+def test_current_alias_tags_through_tag_builder():
+    from loguru import logger
+
+    from acd.l5x.elements import TagBuilder
+    from .rx_fixtures import comps_database, insert_comp
+
+    connection, cur = comps_database()
+    for object_id, name in [(0x11223344, "Rack7"), (0x0A0B0C0D, "&11223344:5:O"), (0x01020304, "Data")]:
+        insert_comp(cur, object_id, name, b"")
+    insert_comp(cur, 99, "MyAlias", _current_tag_record(
+        "MyAlias", "@0a0b0c0d@.@01020304@.7\0".encode("utf-16-le")))
+    insert_comp(cur, 98, "Plain", _current_tag_record("Plain"))
+    insert_comp(cur, 97, "Broken", _current_tag_record("Broken", "@0f0f0f0f@\0".encode("utf-16-le")))
+    warnings = []
+    sink = logger.add(warnings.append, level="WARNING")
+    try:
+        alias = TagBuilder(cur, 99).build()
+        assert (alias.tag_type, alias.alias_for) == ("Alias", "Rack7:5:O.Data.7")
+
+        # A tag with no alias path is not an alias.
+        plain = TagBuilder(cur, 98).build()
+        assert (plain.tag_type, plain.alias_for) == ("Base", None)
+        assert warnings == []
+
+        # An unresolvable alias falls back to a Base tag with a warning.
+        broken = TagBuilder(cur, 97).build()
+        assert (broken.tag_type, broken.alias_for) == ("Base", None)
+        assert len(warnings) == 1 and "Broken" in warnings[0]
+    finally:
+        logger.remove(sink)
+        connection.close()
+
+
+def test_current_alias_tag_matches_reference_export():
+    project = ImportProjectFromFile(AOI_ACD).import_project()
+    tag = next(
+        t for t in _controller(project.to_xml()).iter("Tag")
+        if t.get("Name") == "AliasTag5000String32"
+    )
+    assert tag.get("TagType") == "Alias"
+    assert tag.get("AliasFor") == "a5000_String32.LEN"
+    assert tag.get("DataType") is None
