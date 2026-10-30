@@ -1000,6 +1000,28 @@ class Tag(L5xElement):
     # Type layouts used to decode _data (see value_types_map); falls back to
     # _data_types_map when empty.
     _value_types_map: Dict[str, "DataType"] = field(default_factory=dict)
+    # Program parameter usage (Input, Output, InOut, Public); None for others.
+    usage: Union[str, None] = None
+
+    # Attribute order of Rockwell exports; other fields follow in field order.
+    _ATTRIBUTE_ORDER = (
+        "name", "tag_type", "data_type", "dimensions", "radix", "alias_for",
+        "usage", "constant", "external_access",
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        # Structure, block and module types carry no radix (raw value 0).
+        if self.radix == "NullType":
+            self.radix = None
+        # Rockwell writes Constant on every Base tag.
+        if self.tag_type == "Base" and self.constant is None:
+            self.constant = "false"
+        fields = dict(self.__dict__)
+        self.__dict__.clear()
+        for key in self._ATTRIBUTE_ORDER:
+            self.__dict__[key] = fields.pop(key)
+        self.__dict__.update(fields)
 
     @property
     def _l5x_exclude(self) -> bool:
@@ -2621,6 +2643,8 @@ class TagBuilder(L5xElementBuilder):
             row = None
         if row:
             tag._data = bytes(row[0])
+        if rec:
+            tag.usage = _program_tag_usage(bytes(rec[0]))
         return tag
 
     def _build(self) -> Tag:
@@ -2849,6 +2873,33 @@ class TagBuilder(L5xElementBuilder):
             r.main_record.data_table_instance,
             comment_results,
         )
+
+
+def _program_tag_usage(record: bytes) -> Union[str, None]:
+    """Usage of a program parameter tag, or None for other tags.
+
+    Current-layout program tags (cip_type 0x68) keep usage flags at ext[0x01]
+    offset 0x20E, as Add-On Instruction tags do: 0x04 Input, 0x08 Output
+    (both: InOut), and 0x10 Public (seen with 0x04 also set). Local tags carry
+    only 0x02.
+    """
+    try:
+        r = RxGeneric.from_bytes(record)
+    except Exception:
+        return None
+    if isinstance(r, LegacyRxGeneric) or r.cip_type != 0x68:
+        return None
+    ext01 = next((bytes(e.value) for e in r.extended_records if e.attribute_id == 0x01), b"")
+    flags = _aoi_tag_usage_flags(ext01)
+    if flags & 0x10:
+        return "Public"
+    if flags & 0x0C == 0x0C:
+        return "InOut"
+    if flags & 0x04:
+        return "Input"
+    if flags & 0x08:
+        return "Output"
+    return None
 
 
 def _aoi_tag_usage_flags(ext01: bytes) -> int:
