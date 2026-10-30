@@ -33,6 +33,32 @@ class CompsRecord:
         self._cur.execute("INSERT INTO comps VALUES (?, ?, ?, ?, ?, ?)", entry)
 
     @staticmethod
+    def data_value(dat_record: DatRecord) -> Optional[bytes]:
+        """Return the stored tag data (Rx attribute 0x66) of a modern FAFA record.
+
+        Tag data objects (children of RxDataCollection, referenced by a tag's
+        data_table_instance) keep the tag's raw value in attribute 0x66. That
+        attribute is the last one and runs past the record's declared length,
+        which parse() truncates at, so it is read from the physical record.
+        """
+        if dat_record.identifier != 64250:
+            return None
+        raw = bytes(dat_record.record.record_buffer)
+        if len(raw) < 0x10 or struct.unpack_from("<I", raw, 0x0C)[0] != 0:
+            return None
+        payload = raw[148:]
+        # Rx layout: 74-byte header and main record, then len_record and
+        # count_record, then (u32 attribute_id, u32 length, value) entries.
+        pos = 82
+        while pos + 8 <= len(payload):
+            attribute_id, length = struct.unpack_from("<II", payload, pos)
+            if attribute_id == 0x66:
+                value = payload[pos + 8 : pos + 8 + length]
+                return value if len(value) == length else None
+            pos += 8 + length
+        return None
+
+    @staticmethod
     def parse(dat_record: DatRecord) -> Optional[tuple]:
         raw = bytes(dat_record.record.record_buffer)
 

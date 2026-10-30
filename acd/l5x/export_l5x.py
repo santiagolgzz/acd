@@ -80,6 +80,8 @@ class ExportL5x:
         self._cur.execute(
             "CREATE TABLE region_map(object_id int, parent_id int, unknown int, seq_no int, record BLOB NOT NULL)"
         )
+        log.debug("Create Tag_data table in sqllite db")
+        self._cur.execute("CREATE TABLE tag_data(object_id int, data BLOB NOT NULL)")
         log.debug("Create Rung_uids table in sqllite db")
         self._cur.execute(
             "CREATE TABLE rung_uids(object_id int, parent_id int, uid int)"
@@ -117,13 +119,19 @@ class ExportL5x:
         # or partial record (e.g. record_type=271 vs 259 for routines) that fails to parse
         # correctly with RxGeneric. The full record is always the largest one.
         comps_by_id = {}
+        data_by_id = {}
         for record in comps_db.records.record:
             t = CompsRecord.parse(record)
             if t is not None:
                 oid = t[0]
                 if oid not in comps_by_id or len(t[5]) > len(comps_by_id[oid][5]):
                     comps_by_id[oid] = t
+                    data_by_id[oid] = CompsRecord.data_value(record)
         self._cur.executemany("INSERT INTO comps VALUES (?,?,?,?,?,?)", comps_by_id.values())
+        self._cur.executemany(
+            "INSERT INTO tag_data VALUES (?,?)",
+            [(oid, data) for oid, data in data_by_id.items() if data is not None],
+        )
         self._db.commit()
 
         # Build name lookup for SbRegion tag reference resolution (object_id → comp_name).
@@ -168,6 +176,7 @@ class ExportL5x:
         self._cur.execute("CREATE INDEX idx_rungs_object_id ON rungs(object_id)")
         self._cur.execute("CREATE INDEX idx_region_map_parent_id ON region_map(parent_id)")
         self._cur.execute("CREATE INDEX idx_rung_uids_parent_id ON rung_uids(parent_id)")
+        self._cur.execute("CREATE INDEX idx_tag_data_object_id ON tag_data(object_id)")
         self._cur.execute("CREATE INDEX idx_comments_parent ON comments(parent)")
         self._db.commit()
 
