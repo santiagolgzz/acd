@@ -1414,6 +1414,7 @@ class Routine(L5xElement):
     _rung_ids: List[int] = field(default_factory=list)
     _rung_comments: Dict[int, str] = field(default_factory=dict)
     _st_lines: List[str] = field(default_factory=list)
+    _description: Union[str, None] = None
 
     def to_xml(self) -> str:
         rll_content = ""
@@ -1443,7 +1444,10 @@ class Routine(L5xElement):
                 for i, text in enumerate(self._st_lines)
             ]
             st_content = f'<STContent>{"".join(line_xmls)}</STContent>'
-        return f'<Routine Name="{_escape_xml_attr(self.name)}" Type="{self.type}">{rll_content}{st_content}</Routine>'
+        return (
+            f'<Routine Name="{_escape_xml_attr(self.name)}" Type="{self.type}">'
+            f'{_description_xml(self._description)}{rll_content}{st_content}</Routine>'
+        )
 
 
 @dataclass
@@ -1559,6 +1563,7 @@ class Controller(L5xElement):
     # _redundancy_enabled is NOT serialised as a regular XML attribute (underscore prefix
     # skips it in the base to_xml()); it is used only to build the <RedundancyInfo> element.
     _redundancy_enabled: bool = field(default=False)
+    _description: Union[str, None] = field(default=None)
 
     def __post_init__(self):
         super().__post_init__()
@@ -1587,10 +1592,10 @@ class Controller(L5xElement):
         open_tag = base[: idx + 1]
 
         redundancy_enabled_str = "true" if self._redundancy_enabled else "false"
-        # Reference files carry an empty <Description> stub as the first child.
+        # Reference files carry a <Description> (empty when there is none) as the first child.
         parts = [
             open_tag,
-            "<Description></Description>",
+            _description_xml(self._description) or "<Description></Description>",
             f'<RedundancyInfo Enabled="{redundancy_enabled_str}" KeepTestEditsOnSwitchOver="false"/>',
             '<Security Code="0" ChangesToDetect="16#ffff_ffff_ffff_ffff"/>',
             '<SafetyInfo/>',
@@ -3101,6 +3106,32 @@ def routine_type_enum(idx: int) -> str:
     return "Typeless"
 
 
+def _description_xml(text: Union[str, None]) -> str:
+    """<Description> element for text, or "" when there is none."""
+    return f"<Description>\n{_cdata_section(text)}\n</Description>" if text else ""
+
+
+def _own_description(cur: Cursor, parent: int, alt_parent: Union[int, None],
+                     member_ref: int) -> Union[str, None]:
+    """An object's own description: the comment filed under its key with no
+    operand and no rung (parent = comment scope, member_ref = own key or 0)."""
+    parents = [p for p in (parent, alt_parent) if p]
+    if not parents:
+        return None
+    try:
+        cur.execute(
+            "SELECT record_string FROM comments WHERE parent IN ("
+            + ",".join("?" * len(parents))
+            + ") AND member_ref=? AND rung_content=0 AND tag_reference='' "
+            "AND record_string!='' ORDER BY rowid",
+            (*parents, member_ref),
+        )
+        row = cur.fetchone()
+    except Exception:
+        return None
+    return row[0] if row else None
+
+
 def scoped_comment_keys(raw: bytes) -> Tuple[int, int]:
     """Return (scope key, member key) for a Comps record.
 
@@ -3261,6 +3292,18 @@ class RoutineBuilder(L5xElementBuilder):
         except Exception:
             pass
 
+        # The routine's description: same key as its rung comments, no rung.
+        if isinstance(r, LegacyRxGeneric):
+            scope_key, member_key = _legacy_comment_keys(self._cur, self._object_id)
+        else:
+            scope_key, member_key = scoped_comment_keys(record)
+        if member_key:
+            description = _own_description(self._cur, scope_key, None, member_key)
+        else:
+            description = _own_description(
+                self._cur, (r.comment_id * 0x10000) + r.cip_type, None, 0
+            )
+
         st_lines: List[str] = []
         if routine_type == "ST":
             self._cur.execute(
@@ -3269,7 +3312,10 @@ class RoutineBuilder(L5xElementBuilder):
             )
             st_lines = [row[0] for row in self._cur.fetchall()]
 
-        return Routine(name, name, routine_type, rungs, rung_ids, rung_comments, _st_lines=st_lines)
+        return Routine(
+            name, name, routine_type, rungs, rung_ids, rung_comments,
+            _st_lines=st_lines, _description=description,
+        )
 
 
 def _parse_fffeff(data: bytes, offset: int):
@@ -3770,6 +3816,13 @@ class ControllerBuilder(L5xElementBuilder):
             raise Exception("Does not contain exactly one root controller node")
 
         r = RxGeneric.from_bytes(results[0][4])
+        description = _own_description(
+            self._cur,
+            (r.comment_id * 0x10000) + r.cip_type,
+            _legacy_comment_keys(self._cur, results[0][1])[0]
+            if isinstance(r, LegacyRxGeneric) else None,
+            0,
+        )
         self._cur.execute(
             "SELECT tag_reference, record_string FROM comments WHERE parent="
             + str((r.comment_id * 0x10000) + r.cip_type)
@@ -4134,6 +4187,7 @@ class ControllerBuilder(L5xElementBuilder):
             tasks,
             aois,
             redundancy_enabled,
+            description,
         )
 
 
