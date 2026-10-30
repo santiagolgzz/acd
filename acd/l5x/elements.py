@@ -784,6 +784,26 @@ def _decorated_from_data(dt_base: str, dimensions: Union[str, None], data: bytes
     return f'<Data Format="Decorated">\n<Array {attrs}>{"".join(elements)}</Array>\n</Data>'
 
 
+def taginfo_tags(xml_text: str) -> List[Tuple[str, str, str]]:
+    """(program, tag name, data type) for every tag listed in TagInfo.XML.
+
+    Program is "" for controller-scope tags. Used only as a fallback when a
+    tag's own records don't resolve its data type.
+    """
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return []
+    rows: List[Tuple[str, str, str]] = []
+    for tags in root.findall("Tags"):
+        rows.extend(("", t.get("Name", ""), t.get("DataType", "")) for t in tags.findall("Tag"))
+    for program in root.iter("Program"):
+        tags = program.find("Tags")
+        for t in tags.findall("Tag") if tags is not None else []:
+            rows.append((program.get("Name", ""), t.get("Name", ""), t.get("DataType", "")))
+    return [row for row in rows if row[1] and row[2]]
+
+
 def taginfo_layouts(xml_text: str) -> Dict[str, "DataType"]:
     """Type layouts (size, member offsets and bits) from a project's TagInfo.XML.
 
@@ -2094,6 +2114,21 @@ class ModuleBuilder(L5xElementBuilder):
 
 @dataclass
 class TagBuilder(L5xElementBuilder):
+    def _taginfo_data_type(self, name: str) -> str:
+        # Fallback for tags whose records don't resolve a type (e.g. alarm
+        # tags in legacy files): TagInfo.XML lists every tag with its type.
+        self._cur.execute("SELECT program, data_type FROM taginfo_tags WHERE name=?", (name,))
+        rows = self._cur.fetchall()
+        if len({data_type for _, data_type in rows}) == 1:
+            return rows[0][1]
+        self._cur.execute("SELECT parent_id FROM comps WHERE object_id=?", (self._object_id,))
+        parent = self._cur.fetchone()
+        owner = _routine_owner_name(self._cur, parent[0]) if parent else ""
+        scoped = [data_type for program, data_type in rows if program == owner]
+        if not scoped:
+            scoped = [data_type for program, data_type in rows if program == ""]
+        return scoped[0] if len(scoped) == 1 else ""
+
     @staticmethod
     def _format_rpi(microseconds: int) -> str:
         if microseconds % 1000 == 0:
@@ -2372,6 +2407,8 @@ class TagBuilder(L5xElementBuilder):
 
     def build(self) -> Tag:
         tag = self._build()
+        if not tag.data_type and tag.tag_type != "Alias":
+            tag.data_type = self._taginfo_data_type(tag.name) or tag.data_type
         # Attach the stored value bytes from the tag's data object, if any.
         # Current layout: data_table_instance is the data object's id. Legacy
         # layout: data_table_instance is a data-table address and the data

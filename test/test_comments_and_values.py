@@ -292,3 +292,14 @@ def test_current_alias_tag_matches_reference_export():
     assert tag.get("TagType") == "Alias"
     assert tag.get("AliasFor") == "a5000_String32.LEN"
     assert tag.get("DataType") is None
+
+
+def test_taginfo_tags():
+    from acd.l5x.elements import taginfo_tags
+
+    xml = (
+        '<LogixTagInfo><Tags><Tag Name="CtlTag" DataType="ALARM_DIGITAL"/></Tags>'
+        '<Programs><Program Name="Prog"><Tags><Tag Name="Local1" DataType="TIMER"/>'
+        '</Tags></Program></Programs></LogixTagInfo>'
+    )
+    assert sorted(taginfo_tags(xml)) == [("", "CtlTag", "ALARM_DIGITAL"), ("Prog", "Local1", "TIMER")]

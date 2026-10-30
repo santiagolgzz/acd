@@ -23,6 +23,7 @@ from acd.l5x.elements import (
     ProjectBuilder,
     RSLogix5000Content,
     taginfo_layouts,
+    taginfo_tags,
 )
 from acd.record.comments import CommentsRecord
 from acd.record.comps import CompsRecord
@@ -93,6 +94,7 @@ class ExportL5x:
         self._cur.execute("CREATE TABLE tag_data(object_id int, data BLOB NOT NULL)")
         log.debug("Create Alias_paths table in sqllite db")
         self._cur.execute("CREATE TABLE alias_paths(object_id int, path BLOB NOT NULL)")
+        self._cur.execute("CREATE TABLE taginfo_tags(program text, name text, data_type text)")
         log.debug("Create Rung_uids table in sqllite db")
         self._cur.execute(
             "CREATE TABLE rung_uids(object_id int, parent_id int, uid int)"
@@ -201,6 +203,10 @@ class ExportL5x:
         # before its object_id (see populate_region_map/_parse_region_map).
         self._repair_region_map_gaps()
         self.populate_rung_uids()
+        self._cur.executemany(
+            "INSERT INTO taginfo_tags VALUES (?,?,?)", taginfo_tags(self._taginfo_text())
+        )
+        self._db.commit()
 
         log.info(
             "Getting records from ACD Comments file and storing in sqllite database"
@@ -228,21 +234,25 @@ class ExportL5x:
         self._cur.execute("CREATE INDEX idx_rung_uids_parent_id ON rung_uids(parent_id)")
         self._cur.execute("CREATE INDEX idx_tag_data_object_id ON tag_data(object_id)")
         self._cur.execute("CREATE INDEX idx_alias_paths_object_id ON alias_paths(object_id)")
+        self._cur.execute("CREATE INDEX idx_taginfo_tags_name ON taginfo_tags(name)")
         self._cur.execute("CREATE INDEX idx_comment_keys_object_id ON comment_keys(object_id)")
         self._cur.execute("CREATE INDEX idx_comments_parent ON comments(parent)")
         self._db.commit()
 
-    def _taginfo_layouts(self):
+    def _taginfo_text(self) -> str:
         path = os.path.join(self._temp_dir, "TagInfo.XML")
         if not os.path.exists(path):
-            return {}
+            return ""
         with open(path, "rb") as f:
             raw = f.read()
         encoding = "utf-16" if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else "utf-8-sig"
         text = raw.decode(encoding, errors="replace")
         # ElementTree rejects an encoding declaration on an already-decoded str.
-        text = re.sub(r"^<\?xml[^>]*\?>", "", text.lstrip())
-        return taginfo_layouts(text)
+        return re.sub(r"^<\?xml[^>]*\?>", "", text.lstrip())
+
+    def _taginfo_layouts(self):
+        text = self._taginfo_text()
+        return taginfo_layouts(text) if text else {}
 
     @property
     def controller(self):
