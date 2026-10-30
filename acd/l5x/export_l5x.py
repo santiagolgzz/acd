@@ -15,6 +15,7 @@ from acd.database.dbextract import DbExtract
 from acd.zip.unzip import Unzip
 from loguru import logger as log
 
+from acd.l5x import conversion_notes
 from acd.l5x.catalog_numbers import load_external_catalog
 from acd.l5x.elements import (
     Controller,
@@ -48,6 +49,8 @@ class ExportL5x:
     _catalog_table: Union[Dict[Tuple[int, int, int], str], None] = None
 
     def __post_init__(self):
+        # Notes belong to one conversion; start each one with none.
+        conversion_notes.reset()
         if self._temp_dir is None:
             self._temp_dir = tempfile.mkdtemp(prefix="acd-build-")
             weakref.finalize(self, shutil.rmtree, self._temp_dir, True)
@@ -268,6 +271,8 @@ class ExportL5x:
                 Path(os.path.join(self._temp_dir, "QuickInfo.XML"))
             ).build()
             self._project.controller = self.controller
+            # Read after the controller is built: its fallbacks are noted then.
+            self._project.conversion_notes = conversion_notes.current()
             self._project._raw_files = self._raw_files
             self._project._file_order = self._file_order
             self._project._footer_unknown = self._footer_unknown
@@ -396,11 +401,31 @@ class ExportL5x:
             self._cur.executemany("INSERT INTO region_map VALUES (?, ?, ?, ?, ?)", resolved)
             self._db.commit()
         for parent_id, unknown, seq, n_candidates in unresolved:
-            log.warning(
-                f"Could not recover truncated Region Map entry for routine {parent_id}, "
-                f"seq {seq} ({n_candidates} ambiguous candidates) -- that rung will be "
-                "missing from the export"
-            )
+            routine = self._id_to_name.get(parent_id)
+            routine_label = f"'{routine}'" if routine else str(parent_id)
+            if n_candidates == 0:
+                # No unclaimed rung fits this gap, so no rung is known to be missing.
+                log.warning(
+                    f"Could not recover truncated Region Map entry for routine {parent_id}, "
+                    f"seq {seq} -- it could not be matched to any unclaimed rung, so no "
+                    "rung is known to be missing"
+                )
+                conversion_notes.add(
+                    f"Routine {routine_label}: a truncated Region Map entry (seq {seq}) "
+                    "could not be matched to any unclaimed rung, so no rung is known "
+                    "to be missing"
+                )
+            else:
+                log.warning(
+                    f"Could not recover truncated Region Map entry for routine {parent_id}, "
+                    f"seq {seq} ({n_candidates} ambiguous candidates) -- that rung will be "
+                    "missing from the export"
+                )
+                conversion_notes.add(
+                    f"Routine {routine_label}: a truncated Region Map entry (seq {seq}) "
+                    f"could be any of {n_candidates} rungs -- that rung will be missing "
+                    "from the export"
+                )
 
     @staticmethod
     def _find_region_map_alignment(record, known_rung_ids):
@@ -510,6 +535,11 @@ class ExportL5x:
                         f"entries starting at offset {found_offset} (not the "
                         "usual 0x4E) by matching against known rung object_ids"
                     )
+                    conversion_notes.add(
+                        "Region Map: its stored length doesn't match its size "
+                        f"({len(record)} bytes); entries were re-aligned to offset "
+                        f"{found_offset} by matching known rungs"
+                    )
                 else:
                     identifier_offset = 0x4E
                     log.warning(
@@ -518,6 +548,11 @@ class ExportL5x:
                         "alignment could be confirmed against known rung "
                         "object_ids -- falling back to the modern 0x4E offset, "
                         "which may not be correct for this record"
+                    )
+                    conversion_notes.add(
+                        "Region Map: its stored length doesn't match its size "
+                        f"({len(record)} bytes) and entries could not be matched to "
+                        "known rungs; assumed the usual offset 0x4E, which may be wrong"
                     )
                 entries_length = len(record) - identifier_offset
                 allowed_trailer_lengths = range(16)

@@ -3,7 +3,9 @@ import struct
 import xml.etree.ElementTree as ET
 
 from acd.api import ImportProjectFromFile
+from acd.l5x import conversion_notes
 from acd.l5x.elements import (
+    L5xElement,
     _decorated_from_data,
     _l5k_from_data,
     _logix_string,
@@ -208,3 +210,33 @@ def test_type1_internal_string_records_are_skipped():
     member_name = _dat(_type1_comment(4, b"SomeMember"))
     assert CommentsRecord.parse(real)[3] == "Made up note"
     assert CommentsRecord.parse(member_name) is None
+
+
+def test_notes_added_before_project_is_read_appear_in_comment():
+    export = ExportL5x(AOI_ACD)
+    conversion_notes.add("Made up note: tag 'Fake' used a stand-in value")
+    xml_out = export.project.to_xml()
+    assert xml_out.startswith(
+        "<!-- acd-tools conversion notes:\n"
+        "Made up note: tag 'Fake' used a stand-in value\n-->\n<RSLogix5000Content"
+    )
+    assert _controller(xml_out) is not None
+
+
+def test_stale_notes_are_cleared_by_a_new_export():
+    conversion_notes.add("Made up stale note")
+    xml_out = ExportL5x(AOI_ACD).project.to_xml()
+    assert "Made up stale note" not in xml_out
+
+
+def test_no_notes_leaves_output_unchanged():
+    project = ExportL5x(AOI_ACD).project
+    project.conversion_notes = []
+    assert project.to_xml() == L5xElement.to_xml(project)
+
+
+def test_note_text_is_made_safe_for_xml_comments():
+    note = "Tag 'A--B': x -- y ---> z\nsecond line"
+    comment = conversion_notes.xml_comment([note])
+    assert comment == "<!-- acd-tools conversion notes:\nTag 'A-B': x - y -> z second line\n-->\n"
+    assert ET.fromstring(comment + "<Root/>").tag == "Root"

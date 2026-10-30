@@ -14,6 +14,7 @@ from typing import List, Tuple, Dict, Union
 
 from loguru import logger as log
 
+from acd.l5x import conversion_notes
 from acd.l5x.catalog_numbers import CATALOG_NUMBERS, catalog_number_for_identity
 from acd.l5x.port_structures import PORT_STRUCTURES
 from acd.record.rx import LegacyRxGeneric, RxGeneric
@@ -1493,10 +1494,18 @@ class RSLogix5000Content(L5xElement):
     contains_context: str
     export_date: str
     export_options: str
+    # Fallbacks taken during the conversion, written as an XML comment at the
+    # top of the file (see conversion_notes.py). Empty means no comment.
+    conversion_notes: List[str] = field(default_factory=list)
 
     def __post_init__(self):
         super().__post_init__()
         self._export_name = "RSLogix5000Content"
+
+    def to_xml(self) -> str:
+        # The comment comes before the root element, so it lands right after
+        # the XML declaration that the caller writes first.
+        return conversion_notes.xml_comment(self.conversion_notes) + super().to_xml()
 
 
 def radix_enum(i: int) -> str:
@@ -2472,6 +2481,10 @@ class TagBuilder(L5xElementBuilder):
                     f"connection info ({e}) -- exporting it as a Base tag "
                     "instead"
                 )
+                conversion_notes.add(
+                    f"Tag '{name}': {tag_type.lower()} connection info could not "
+                    "be read; exported as a Base tag"
+                )
                 tag_type = "Base"
                 produce_info = None
                 consume_info = None
@@ -3298,6 +3311,10 @@ class TaskBuilder(L5xElementBuilder):
                 "-- this task record's layout doesn't match the known format; "
                 "exporting it with an empty scheduled-program list"
             )
+            conversion_notes.add(
+                f"Task '{name}': scheduled-program list could not be read; "
+                "exported with an empty list"
+            )
         else:
             for i in range(prog_count):
                 cid = struct.unpack_from(
@@ -3527,6 +3544,10 @@ class ControllerBuilder(L5xElementBuilder):
                     f"failed to parse its comps record ({type(e).__name__}: {e}) "
                     "-- exporting it as an empty placeholder program"
                 )
+                conversion_notes.add(
+                    f"Program '{program_name}': could not be read; exported as an "
+                    "empty placeholder"
+                )
                 programs.append(
                     Program(program_name, program_name, "false", None, None,
                              "false", None, "false", [], [])
@@ -3551,6 +3572,10 @@ class ControllerBuilder(L5xElementBuilder):
                     f"Program '{pname}': couldn't determine its task-schedule "
                     f"ID ({type(e).__name__}: {e}) -- it won't appear in any "
                     "task's scheduled-program list"
+                )
+                conversion_notes.add(
+                    f"Program '{pname}': task-schedule ID could not be read; it "
+                    "won't appear in any task's scheduled-program list"
                 )
 
         # Get the Task Collection and build Tasks
