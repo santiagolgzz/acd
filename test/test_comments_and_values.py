@@ -368,3 +368,18 @@ def test_legacy_data_type_members():
     assert (run._offset, run._bit) == (0, 3)
     assert (speed.name, speed.data_type, speed.radix, speed._offset) == ("Speed", "REAL", "Float", 4)
     assert speed.external_access == "Read/Write"
+
+
+def test_rung_text_with_invalid_utf16_is_kept(monkeypatch):
+    from types import SimpleNamespace
+    from acd.record import sbregion
+
+    fake = SimpleNamespace(
+        header=SimpleNamespace(language_type="Rung NT", identifier=7),
+        record_buffer="NOP();".encode("utf-16-le") + b"\x00\xd8",  # lone surrogate
+    )
+    monkeypatch.setattr(sbregion.FafaSbregions, "from_bytes", lambda _: fake)
+    conversion_notes.reset()
+    entry = sbregion.SbRegionRecord.parse(_dat(b""), {})
+    assert entry[1].startswith("NOP();")
+    assert "not valid UTF-16" in conversion_notes.current()[0]

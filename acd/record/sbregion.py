@@ -5,6 +5,7 @@ from sqlite3 import Cursor
 from typing import Dict, Optional
 
 from acd.database.dbextract import DatRecord
+from acd.l5x import conversion_notes
 
 from acd.generated.sbregion.fafa_sbregions import FafaSbregions
 
@@ -49,7 +50,17 @@ class SbRegionRecord:
         r = FafaSbregions.from_bytes(dat_record.record.record_buffer)
         if r.header.language_type not in ("Rung NT", "REGION NT"):
             return None
-        text = r.record_buffer.decode("utf-16-le").rstrip("\x00")
+        buffer = bytes(r.record_buffer)
+        try:
+            text = buffer.decode("utf-16-le").rstrip("\x00")
+        except UnicodeDecodeError:
+            # Keep the rung rather than abort the whole conversion; mark the
+            # undecodable bytes and say so in the output (issue #35).
+            text = buffer[: len(buffer) // 2 * 2].decode("utf-16-le", errors="replace").rstrip("\x00")
+            conversion_notes.add(
+                f"Rung {r.header.identifier}: text is not valid UTF-16; "
+                "undecodable characters are shown as U+FFFD"
+            )
         for tag in re.findall("@[A-Za-z0-9]*@", text):
             tag_id = int(tag[1:-1], 16)
             name = name_lookup.get(tag_id)
