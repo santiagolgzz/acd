@@ -191,13 +191,13 @@ def test_taginfo_layouts():
         '<Member Name="Pos" DataType="REAL" Offset="4"><Dimensions><Dim Size="2"/></Dimensions></Member>'
         '</Members></DataType></DataTypes></LogixTagInfo>'
     )
-    seat = taginfo_layouts(xml)["SEAT"]
+    seat = taginfo_layouts(ET.fromstring(xml))["SEAT"]
     assert seat._size == 12
     extend, pos = seat.members[1], seat.members[2]
     assert (extend._offset, extend._bit, extend.hidden) == (0, 1, False)
     assert (pos.data_type, pos.dimension, pos._offset) == ("REAL", 2, 4)
     data = bytes([0b10, 0, 0, 0]) + struct.pack("<ff", 1.5, 2.0)
-    xml_out = _decorated_from_data("SEAT", None, data, taginfo_layouts(xml))
+    xml_out = _decorated_from_data("SEAT", None, data, taginfo_layouts(ET.fromstring(xml)))
     assert 'Name="Extend" DataType="BOOL" Value="1"' in xml_out
     assert '<Element Index="[1]" Value="2.0"/>' in xml_out
 
@@ -318,7 +318,7 @@ def test_taginfo_tags():
         '<Programs><Program Name="Prog"><Tags><Tag Name="Local1" DataType="TIMER"/>'
         '</Tags></Program></Programs></LogixTagInfo>'
     )
-    assert sorted(taginfo_tags(xml)) == [("", "CtlTag", "ALARM_DIGITAL"), ("Prog", "Local1", "TIMER")]
+    assert sorted(taginfo_tags(ET.fromstring(xml))) == [("", "CtlTag", "ALARM_DIGITAL"), ("Prog", "Local1", "TIMER")]
 
 
 

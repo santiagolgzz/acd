@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from os import PathLike
 from pathlib import Path
 from sqlite3 import Cursor
-from typing import List, NamedTuple, Tuple, Dict, Union
+from typing import Any, List, NamedTuple, Tuple, Dict, Union
 
 from loguru import logger as log
 
@@ -88,15 +88,6 @@ def _sanitize_path_component(name: str) -> str:
 class L5xElementBuilder:
     _cur: Cursor
     _object_id: int = -1
-
-
-def _get_program_records(cur: Cursor, collection_id: int) -> List[Tuple[str, int, int, bytes]]:
-    cur.execute(
-        "SELECT comp_name, object_id, record_type, record FROM comps "
-        "WHERE parent_id=? AND record_type=256",
-        (collection_id,),
-    )
-    return cur.fetchall()
 
 
 def _get_aoi_records(cur: Cursor, controller_id: int) -> List[Tuple[str, int, int, int]]:
@@ -884,16 +875,12 @@ def _decorated_from_data(dt_base: str, dimensions: Union[str, None], data: bytes
     return f'<Data Format="Decorated">\n<Array {attrs}>{"".join(elements)}</Array>\n</Data>'
 
 
-def taginfo_tags(xml_text: str) -> List[Tuple[str, str, str]]:
+def taginfo_tags(root: ET.Element) -> List[Tuple[str, str, str]]:
     """(program, tag name, data type) for every tag listed in TagInfo.XML.
 
     Program is "" for controller-scope tags. Used only as a fallback when a
     tag's own records don't resolve its data type.
     """
-    try:
-        root = ET.fromstring(xml_text)
-    except ET.ParseError:
-        return []
     rows: List[Tuple[str, str, str]] = []
     for tags in root.findall("Tags"):
         rows.extend(("", t.get("Name", ""), t.get("DataType", "")) for t in tags.findall("Tag"))
@@ -904,17 +891,13 @@ def taginfo_tags(xml_text: str) -> List[Tuple[str, str, str]]:
     return [row for row in rows if row[1] and row[2]]
 
 
-def taginfo_layouts(xml_text: str) -> Dict[str, "DataType"]:
+def taginfo_layouts(root: ET.Element) -> Dict[str, "DataType"]:
     """Type layouts (size, member offsets and bits) from a project's TagInfo.XML.
 
     TagInfo.XML lists every type the project uses, including Add-On
     Instructions and module-defined types, with byte offsets. Only the
     layout is kept; it is used to decode stored tag values, not exported.
     """
-    try:
-        root = ET.fromstring(xml_text)
-    except ET.ParseError:
-        return {}
     layouts: Dict[str, DataType] = {}
     for dt in root.iter("DataType"):
         members = []
@@ -3471,6 +3454,8 @@ class ProgramBuilder(L5xElementBuilder):
     _data_types_map: Dict[str, "DataType"] = field(default_factory=dict)
     _redundancy_enabled: bool = field(default=False)
     _value_types_map: Dict[str, "DataType"] = field(default_factory=dict)
+    # The program's parsed record, when the caller already has it.
+    _record: Any = field(default=None)
 
     def build(self) -> Program:
         self._cur.execute(
@@ -3482,8 +3467,7 @@ class ProgramBuilder(L5xElementBuilder):
             raise ValueError(f"program object_id={self._object_id} was not found")
 
         name, record_type, record = row
-        prog_record = bytes(record)
-        r = RxGeneric.from_bytes(prog_record)
+        r = self._record if self._record is not None else RxGeneric.from_bytes(record)
 
         # --- MainRoutineName and FaultRoutineName from extended records ---
         # ext[0x12D] = MainRoutine object_id, ext[0x066] = FaultRoutine object_id
@@ -3584,8 +3568,9 @@ class ProgramBuilder(L5xElementBuilder):
 _TASK_TYPE_MAP = {1: "EVENT", 2: "PERIODIC", 4: "CONTINUOUS"}
 
 
-def _program_schedule_id(record: bytes) -> int:
-    parsed = RxGeneric.from_bytes(record)
+def _program_schedule_id(parsed) -> int:
+    """A program's task-schedule id: attribute 0x01 offset 267 in legacy
+    records, the Rx comment id in current ones."""
     if isinstance(parsed, LegacyRxGeneric):
         metadata = parsed.attribute(0x01) or b""
         if len(metadata) < 271:
@@ -3846,63 +3831,59 @@ class ControllerBuilder(L5xElementBuilder):
             raise Exception("Contains more than one controller program collection")
 
         _program_collection_object_id = results[0][1]
-        program_records = _get_program_records(self._cur, _program_collection_object_id)
-        programs: List[Program] = []
-        for result in program_records:
-            _program_object_id = result[1]
-            try:
-                programs.append(
-                    ProgramBuilder(
-                        self._cur, _program_object_id, data_types_map, redundancy_enabled,
-                        _value_types_map=value_types_map,
-                    ).build()
-                )
-            except Exception as e:
-                # Observed on a real project file: one program's comps record
-                # has a corrupt extended-attribute length prefix partway
-                # through (a kaitaistruct EndOfStreamError reading it), with
-                # no way to resync to the right attribute boundaries once
-                # that happens. Losing that one program's routines/tags is
-                # far better than losing the whole project's export over it.
-                program_name = result[0]
-                log.warning(
-                    f"Program '{program_name}' (object_id={_program_object_id}): "
-                    f"failed to parse its comps record ({type(e).__name__}: {e}) "
-                    "-- exporting it as an empty placeholder program"
-                )
-                conversion_notes.add(
-                    f"Program '{program_name}': could not be read; exported as an "
-                    "empty placeholder"
-                )
-                programs.append(
-                    Program(program_name, program_name, "false", None, None,
-                             "false", None, "false", [], [])
-                )
-
-        # Build task schedule ID → program name map. Legacy projects keep this
-        # ID in program attribute 0x01; newer records use the Rx comment ID.
+        # The collection's record_type 256 children are programs; every child
+        # goes into the task schedule ID -> program name map.
         self._cur.execute(
-            "SELECT comp_name, record FROM comps WHERE parent_id=" + str(_program_collection_object_id)
+            "SELECT comp_name, object_id, record_type, record FROM comps WHERE parent_id=?",
+            (_program_collection_object_id,),
         )
+        programs: List[Program] = []
         comment_id_to_program: Dict[int, str] = {}
-        for pname, rec in self._cur.fetchall():
+        schedule_notes: List[str] = []
+        for pname, program_oid, record_type, rec in self._cur.fetchall():
+            # A program record can have a corrupt attribute length partway
+            # through; export a placeholder rather than fail the project.
             try:
-                comment_id_to_program[_program_schedule_id(bytes(rec))] = pname
+                r = RxGeneric.from_bytes(rec)
+                comment_id_to_program[_program_schedule_id(r)] = pname
             except Exception as e:
-                # Same corrupt-comps-record case ProgramBuilder.build() above
-                # already tolerates (a program whose extended-attribute list
-                # can't be parsed at all). This program just won't be
-                # resolvable as a task's scheduled program -- better than
-                # losing the whole project's export over one bad record.
+                r = None
                 log.warning(
                     f"Program '{pname}': couldn't determine its task-schedule "
                     f"ID ({type(e).__name__}: {e}) -- it won't appear in any "
                     "task's scheduled-program list"
                 )
-                conversion_notes.add(
+                schedule_notes.append(
                     f"Program '{pname}': task-schedule ID could not be read; it "
                     "won't appear in any task's scheduled-program list"
                 )
+            if record_type != 256:
+                continue
+            try:
+                if r is None:
+                    raise ValueError("its record could not be parsed")
+                programs.append(
+                    ProgramBuilder(
+                        self._cur, program_oid, data_types_map, redundancy_enabled,
+                        _value_types_map=value_types_map, _record=r,
+                    ).build()
+                )
+            except Exception as e:
+                log.warning(
+                    f"Program '{pname}' (object_id={program_oid}): "
+                    f"failed to parse its comps record ({type(e).__name__}: {e}) "
+                    "-- exporting it as an empty placeholder program"
+                )
+                conversion_notes.add(
+                    f"Program '{pname}': could not be read; exported as an "
+                    "empty placeholder"
+                )
+                programs.append(
+                    Program(pname, pname, "false", None, None,
+                             "false", None, "false", [], [])
+                )
+        for note in schedule_notes:
+            conversion_notes.add(note)
 
         # Get the Task Collection and build Tasks
         self._cur.execute(

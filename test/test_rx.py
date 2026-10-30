@@ -438,7 +438,7 @@ def test_legacy_program_schedule_id_and_task():
             (0x01, _metadata("MainProgram", schedule_id=schedule_id))
         ],
     )
-    assert _program_schedule_id(program) == schedule_id
+    assert _program_schedule_id(RxGeneric.from_bytes(program)) == schedule_id
 
     task_data = bytearray(806)
     struct.pack_into("<H", task_data, 0, 1)

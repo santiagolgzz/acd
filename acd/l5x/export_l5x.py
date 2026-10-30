@@ -6,6 +6,7 @@ import sqlite3
 import struct
 import tempfile
 import weakref
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 from sqlite3 import Cursor
@@ -25,6 +26,7 @@ from acd.l5x.elements import (
     taginfo_layouts,
     taginfo_tags,
 )
+from acd.l5x.st_decoder import STDecoder
 from acd.record.comments import CommentsRecord
 from acd.record.comps import CompsRecord
 from acd.record.nameless import NamelessRecord
@@ -134,14 +136,15 @@ class ExportL5x:
         legacy_records = 0
         # Every Region Map record seen; a file can hold stale copies that fail
         # validation, so populate_region_map tries them all.
-        self._region_map_candidates: List[bytes] = []
+        region_map_candidates: List[bytes] = []
+        self._pending_region_map_gaps: List[Tuple[int, int, int]] = []
         for record in comps_db.records.record:
             if record.identifier == 64250 and CompsRecord.is_legacy(bytes(record.record.record_buffer)):
                 legacy_records += 1
             t = CompsRecord.parse(record)
             if t is not None:
                 if t[1] == 0 and t[2] == "Region Map":
-                    self._region_map_candidates.append(bytes(t[5]))
+                    region_map_candidates.append(bytes(t[5]))
                 oid = t[0]
                 if oid not in comps_by_id or len(t[5]) > len(comps_by_id[oid][5]):
                     comps_by_id[oid] = t
@@ -176,16 +179,18 @@ class ExportL5x:
         log.info(
             "Getting records from ACD Region Map file and storing in sqllite database"
         )
-        self.populate_region_map()
+        self.populate_region_map(region_map_candidates)
 
         # Now that `rungs` (and its on-disk insertion order) and `region_map`
         # both exist, try to recover any Region Map entry that was truncated
         # before its object_id (see populate_region_map/_parse_region_map).
         self._repair_region_map_gaps()
         self.populate_rung_uids()
-        self._cur.executemany(
-            "INSERT INTO taginfo_tags VALUES (?,?,?)", taginfo_tags(self._taginfo_text())
-        )
+        taginfo = self._read_taginfo()
+        # Type layouts from TagInfo.XML, for decoding tag values.
+        self._taginfo_layouts = taginfo_layouts(taginfo) if taginfo is not None else {}
+        if taginfo is not None:
+            self._cur.executemany("INSERT INTO taginfo_tags VALUES (?,?,?)", taginfo_tags(taginfo))
         self._db.commit()
 
         log.info(
@@ -212,7 +217,7 @@ class ExportL5x:
         try:
             st_tuples = [
                 (comps_id, number, text)
-                for _name, comps_id, lines in self.st_decoder().all_routines()
+                for _name, comps_id, lines in STDecoder(self).all_routines()
                 for number, text in enumerate(lines)
             ]
             self._cur.executemany("INSERT INTO st_lines VALUES (?,?,?)", st_tuples)
@@ -237,49 +242,29 @@ class ExportL5x:
         self._cur.execute("CREATE INDEX idx_st_lines_routine_id ON st_lines(routine_id)")
         self._db.commit()
 
-    def _taginfo_text(self) -> str:
+    def _read_taginfo(self) -> Union[ET.Element, None]:
+        """TagInfo.XML's root element, or None when it is missing or unreadable."""
         path = os.path.join(self._temp_dir, "TagInfo.XML")
         if not os.path.exists(path):
-            return ""
+            return None
         with open(path, "rb") as f:
             raw = f.read()
         encoding = "utf-16" if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else "utf-8-sig"
         text = raw.decode(encoding, errors="replace")
         # ElementTree rejects an encoding declaration on an already-decoded str.
-        return re.sub(r"^<\?xml[^>]*\?>", "", text.lstrip())
-
-    def _taginfo_layouts(self):
-        text = self._taginfo_text()
-        return taginfo_layouts(text) if text else {}
+        try:
+            return ET.fromstring(re.sub(r"^<\?xml[^>]*\?>", "", text.lstrip()))
+        except ET.ParseError:
+            return None
 
     @property
     def controller(self):
         if self._controller is None:
             self._controller = ControllerBuilder(
                 self._cur, _catalog_table=self._catalog_table,
-                _taginfo_layouts=self._taginfo_layouts(),
+                _taginfo_layouts=self._taginfo_layouts,
             ).build()
         return self._controller
-
-    def st_decoder(self) -> "STDecoder":
-        """Return an STDecoder for this ACD file.
-
-        Must be called **before** accessing ``.project`` (which closes the
-        sqlite connection).  The returned :class:`STDecoder` holds its own
-        in-memory copy of all necessary data and remains usable after
-        ``.project`` is called.
-
-        Example::
-
-            exp = ExportL5x("project.acd")
-            dec = exp.st_decoder()          # create while DB is open
-            project = exp.project           # DB closes here; dec still works
-
-            for name, comps_id, lines in dec.all_routines():
-                print(f"{name}: {len(lines)} lines")
-        """
-        from acd.l5x.st_decoder import STDecoder  # local import avoids circular refs
-        return STDecoder(self)
 
     @property
     def project(self):
@@ -307,18 +292,18 @@ class ExportL5x:
             self._db.close()
         return self._project
 
-    def populate_region_map(self):
+    def populate_region_map(self, region_map_candidates: List[bytes]):
         # A file can hold several Region Map records (stale copies among
         # them). Use the largest one whose stored length checks out; only if
         # none does, fall back to re-aligning the largest one against the
         # known rung object_ids (see _parse_region_map).
-        candidates = sorted(self._region_map_candidates, key=len, reverse=True)
+        candidates = sorted(region_map_candidates, key=len, reverse=True)
 
         # Entries with a resolved object_id are inserted immediately. A
         # trailing 12-byte (parent_id, unknown, seq) triple with no object_id
         # (see _parse_region_map) is stashed for _repair_region_map_gaps(),
         # which can only run once the `rungs` table exists.
-        self._pending_region_map_gaps: List[Tuple[int, int, int]] = []
+        self._pending_region_map_gaps = []
 
         if not candidates:
             return
@@ -370,7 +355,7 @@ class ExportL5x:
         whichever one sits between those neighbours in on-disk order -- so
         if exactly one unclaimed rung qualifies, it's the answer.
         """
-        if not getattr(self, "_pending_region_map_gaps", None):
+        if not self._pending_region_map_gaps:
             return
 
         # object_id -> rowid, for every rung, in on-disk insertion order.
@@ -661,10 +646,12 @@ class ExportL5x:
         # byte to be 0x02 as it is on every rung link record.
         wanted = {struct.pack("<II", parent, rung): (rung, parent) for rung, parent in rungs}
         found = {}
-        for i in range(10, len(data) - 7):
-            key = data[i : i + 8]
-            if key in wanted and data[i - 8] == 0x02 and wanted[key] not in found:
-                found[wanted[key]] = struct.unpack_from("<H", data, i - 4)[0]
+        j = data.find(b"\x02", 2)
+        while j != -1 and j + 16 <= len(data):
+            key = data[j + 8 : j + 16]
+            if key in wanted and wanted[key] not in found:
+                found[wanted[key]] = struct.unpack_from("<H", data, j + 4)[0]
+            j = data.find(b"\x02", j + 1)
         return [(rung, parent, uid) for (rung, parent), uid in found.items()]
 
 
