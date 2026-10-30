@@ -59,44 +59,39 @@ class CompsRecord:
         """Return the stored tag data (Rx attribute 0x66) of a FAFA record.
 
         Tag data objects (children of RxDataCollection, referenced by a tag's
-        data_table_instance) keep the tag's raw value in attribute 0x66. That
-        attribute is the last one and runs past the record's declared length,
-        which parse() truncates at, so it is read from the physical record.
+        data_table_instance) keep the tag's raw value in attribute 0x66, the
+        record's last attribute (kept whole by parse()).
         """
         if dat_record.identifier != 64250:
             return None
-        raw = bytes(dat_record.record.record_buffer)
-        if len(raw) < 0x10:
+        entry = CompsRecord.parse(dat_record)
+        if entry is None:
             return None
-        if struct.unpack_from("<I", raw, 0x0C)[0] != 0:
-            # Legacy layout: parse() keeps the whole record; attributes start
-            # at 32 (see LegacyRxGeneric).
-            entry = CompsRecord.parse(dat_record)
-            if entry is None:
-                return None
-            payload, pos = bytes(entry[5]), 32
-        else:
-            # Rx layout: 74-byte header and main record, then len_record and
-            # count_record, then (u32 attribute_id, u32 length, value) entries.
-            payload, pos = raw[148:], 82
-        return CompsRecord._attribute(payload, pos, 0x66)
+        raw = bytes(dat_record.record.record_buffer)
+        # Attributes start at 32 of the legacy payload (see LegacyRxGeneric)
+        # and at 82 of the Rx payload (74-byte header and main record, then
+        # len_record and count_record).
+        pos = 32 if struct.unpack_from("<I", raw, 0x0C)[0] != 0 else 82
+        return CompsRecord._attribute(bytes(entry[5]), pos, 0x66)
 
     @staticmethod
     def alias_path(dat_record: DatRecord) -> Optional[bytes]:
         """Return the alias path (Rx attribute 0x65) of a current-layout tag.
 
         Alias tags keep their target as a utf-16 path of object IDs, the same
-        form legacy files use (e.g. "@<tag id>@.@<member id>@.13"). It is the
-        tag record's last attribute and runs past the declared length that
-        parse() truncates at, so it is read from the physical record. Legacy
-        records keep it intact in parse() already and return None here.
+        form legacy files use (e.g. "@<tag id>@.@<member id>@.13"), as the tag
+        record's last attribute. Legacy records are read through
+        LegacyRxGeneric instead and return None here.
         """
         if dat_record.identifier != 64250:
             return None
         raw = bytes(dat_record.record.record_buffer)
         if len(raw) < 158 or struct.unpack_from("<I", raw, 0x0C)[0] != 0:
             return None
-        payload = raw[148:]
+        entry = CompsRecord.parse(dat_record)
+        if entry is None:
+            return None
+        payload = bytes(entry[5])
         if struct.unpack_from("<H", payload, 10)[0] not in (0x68, 0x6B):
             return None
         return CompsRecord._attribute(payload, 82, 0x65)
@@ -179,6 +174,19 @@ class CompsRecord:
 
         if dat_record.identifier == 64250:
             r = FafaComps.from_bytes(raw)
+            # The declared length stops four bytes short of the record's last
+            # Rx attribute (the same quirk as the legacy layout above); keep
+            # those bytes so the final attribute is complete.
+            end = 148 + len(r.record_buffer) + 4
+            buffer = raw[148:end] if end <= len(raw) else r.record_buffer
+            return (
+                r.header.object_id,
+                r.header.parent_id,
+                r.header.record_name.value,
+                r.header.seq_number,
+                r.header.record_type,
+                buffer,
+            )
         elif dat_record.identifier == 65021:
             r = FdfdComps(
                 dat_record.len_record,
