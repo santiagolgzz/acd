@@ -26,3 +26,16 @@ def test_cutelogix_every_rung_is_in_region_map(tmp_path):
     rungs = {r[0] for r in cur.execute("SELECT object_id FROM rungs")}
     mapped = {r[0] for r in cur.execute("SELECT object_id FROM region_map")}
     assert rungs - mapped == set()
+
+
+def test_last_map_entry_can_be_a_mid_routine_rung():
+    # The map's last entry is not always the routine's last rung: in real files
+    # it was rung 3 or rung 41 of a longer routine. Rungs are ordered by the
+    # position field, so keeping the last entry must restore the middle rung.
+    entries = [(7, 0, 1, 0x10), (7, 2, 3, 0x30), (7, 1, 2, 0x20)]
+    record = bytearray(0x4E)
+    for parent, position, seq, oid in entries:
+        record += b"".join(v.to_bytes(4, "little") for v in (parent, position, seq, oid))
+    record[0x4A:0x4E] = (len(record) - 0x4E).to_bytes(4, "little")
+    parsed = ExportL5x._parse_region_map(bytes(record))
+    assert [e[0] for e in sorted(parsed, key=lambda e: e[2])] == [0x10, 0x20, 0x30]
