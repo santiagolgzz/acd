@@ -208,3 +208,52 @@ def test_type1_internal_string_records_are_skipped():
     member_name = _dat(_type1_comment(4, b"SomeMember"))
     assert CommentsRecord.parse(real)[3] == "Made up note"
     assert CommentsRecord.parse(member_name) is None
+
+
+def _legacy_member(name: str, radix: int, type_id: int, offset: int, bit: int, host: int, hidden: int) -> bytes:
+    # Name (UTF-16LE, 0x54 bytes), then radix, type object, dimension,
+    # offset, bit, host index (0x800: not a BIT), 0x6C, hidden, access.
+    return name.encode("utf-16-le").ljust(0x54, b"\0") + struct.pack(
+        "<9I", radix, type_id, 0, offset, bit, host, 0xFFFFFFFF, hidden, 1
+    ) + bytes(0x30)
+
+
+def test_legacy_data_type_members():
+    import sqlite3
+
+    from acd.l5x.elements import DataTypeBuilder
+
+    members = [
+        _legacy_member("ZZZZZZZZZZPump0", 4, 0x51, 0, 0, 0x800, 1),
+        _legacy_member("Run", 4, 0x52, 0, 3, 0, 0),
+        _legacy_member("Speed", 7, 0x53, 4, 0, 0x800, 0),
+    ]
+    attrs = [(0x64, struct.pack("<I", len(members))), (0x65, struct.pack("<I", 8))]
+    attrs += [(0x6E + i, m) for i, m in enumerate(members)]
+    body = b"".join(struct.pack("<II", k, len(v)) + v for k, v in attrs)
+    # Legacy header: cip type 0x6C at 8, object id at 20, body length and
+    # attribute count at 24.
+    record = bytearray(32) + body
+    struct.pack_into("<HHHI", record, 8, 0x6C, 0, 0, 0)
+    struct.pack_into("<III", record, 20, 0x99, len(body) + 4, len(attrs))
+
+    db = sqlite3.connect(":memory:")
+    cur = db.cursor()
+    cur.execute("CREATE TABLE comps(object_id int, parent_id int, comp_name text, seq_number int, record_type int, record BLOB)")
+    cur.execute("CREATE TABLE comment_keys(object_id int, scope_key int, member_key int)")
+    cur.execute("CREATE TABLE comments(parent int, member_ref int, record_string text)")
+    cur.executemany("INSERT INTO comps VALUES (?,?,?,0,0,?)", [
+        (0x51, 0, "SINT", b""), (0x52, 0, "BOOL", b""), (0x53, 0, "REAL", b""),
+        (0x99, 0, "Pump", bytes(record)),
+    ])
+    cur.execute("INSERT INTO comment_keys VALUES (0x99, 0x1234006C, 0)")
+    cur.execute("INSERT INTO comments VALUES (0x1234006C, 0, 'Made up pump')")
+
+    pump = DataTypeBuilder(cur, 0x99).build()
+    assert (pump.cls, pump._size, pump._description) == ("User", 8, "Made up pump")
+    host, run, speed = pump.members
+    assert (host.data_type, host.hidden, host.radix) == ("SINT", True, "Decimal")
+    assert (run.data_type, run.target, run.bit_number, run.dimension) == ("BIT", "ZZZZZZZZZZPump0", 3, 0)
+    assert (run._offset, run._bit) == (0, 3)
+    assert (speed.name, speed.data_type, speed.radix, speed._offset) == ("Speed", "REAL", "Float", 4)
+    assert speed.external_access == "Read/Write"
