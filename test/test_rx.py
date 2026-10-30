@@ -3,7 +3,7 @@ import struct
 
 import pytest
 
-from acd.l5x.elements import TagBuilder, TaskBuilder, _program_schedule_id
+from acd.l5x.elements import RoutineBuilder, TagBuilder, TaskBuilder, _program_schedule_id
 from acd.record.rx import LegacyRxGeneric, RxGeneric
 
 
@@ -479,5 +479,21 @@ def test_legacy_task_ignores_excess_program_count():
         # drop the unreadable schedule list.
         task = TaskBuilder(cursor, 100).build({})
         assert task.scheduled_programs == []
+    finally:
+        database.close()
+
+
+def test_protected_routine_keeps_its_type():
+    # 14-byte header, 60-byte main record (type 1 = RLL at 0x30), then an
+    # extended-attribute area whose lengths are unreadable (encrypted).
+    main = bytearray(60)
+    struct.pack_into("<H", main, 0x30, 1)
+    header = struct.pack("<IIHHH", 0, 0, 0, 0x6D, 0)
+    record = header + bytes(main) + struct.pack("<II", 999, 2) + struct.pack("<II", 0x01, 0x55555555)
+    database, cursor = _database()
+    try:
+        _insert(cursor, 100, "Logic", record)
+        routine = RoutineBuilder(cursor, 100).build()
+        assert (routine.type, routine.rungs) == ("RLL", [])
     finally:
         database.close()

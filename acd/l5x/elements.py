@@ -2787,7 +2787,17 @@ class RoutineBuilder(L5xElementBuilder):
         try:
             r = RxGeneric.from_bytes(results[0][3])
         except Exception as e:
-            return Routine(results[0][0], results[0][0], "", [])
+            # Source-protected (encrypted) routines carry unreadable extended
+            # attributes, but their 60-byte main record is intact, so the
+            # routine type can still be read from it (0x30 of the main record,
+            # which starts at 14).
+            raw = bytes(results[0][3])
+            routine_type = (
+                routine_type_enum(struct.unpack_from("<H", raw, 14 + 0x30)[0])
+                if len(raw) >= 74
+                else ""
+            )
+            return Routine(results[0][0], results[0][0], routine_type, [])
 
         record = results[0][3]
         name = results[0][0]
