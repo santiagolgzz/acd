@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from os import PathLike
 from pathlib import Path
 from sqlite3 import Cursor
-from typing import List, Tuple, Dict, Union
+from typing import List, NamedTuple, Tuple, Dict, Union
 
 from loguru import logger as log
 
@@ -1732,6 +1732,25 @@ def external_access_enum(i: int) -> str:
     return default
 
 
+class _MemberFields(NamedTuple):
+    radix: int
+    type_id: int
+    dimension: int
+    offset: int
+    bit: int
+    host: int
+    target_key: int
+    hidden: int
+    access: int
+
+
+def _member_fields(rec: bytes) -> _MemberFields:
+    """The u32 fields of a data type member record, from 0x54: radix, type
+    object, dimension, byte offset (0x60), bit, host (0x68), target key
+    (0x6C), hidden (0x70) and external access (0x74)."""
+    return _MemberFields(*struct.unpack_from("<9I", rec, 0x54))
+
+
 @dataclass
 class MemberBuilder(L5xElementBuilder):
     record: bytes = field(default_factory=bytes)
@@ -1755,18 +1774,15 @@ class MemberBuilder(L5xElementBuilder):
         except Exception as e:
             return Member(name, name, "", 0, "Decimal", False, None, None, "Read/Write")
 
-        cip_data_typoe = struct.unpack_from("<I", self.record, 0x78)[0]
-        dimension = struct.unpack_from("<I", self.record, 0x5C)[0]
-        radix = radix_enum(struct.unpack_from("<I", self.record, 0x54)[0])
-        data_type_id = struct.unpack_from("<I", self.record, 0x58)[0]
-        hidden = bool(struct.unpack_from("<I", self.record, 0x70)[0])
-        external_access = external_access_enum(
-            struct.unpack_from("<I", self.record, 0x74)[0]
-        )
+        fields = _member_fields(self.record)
+        dimension = fields.dimension
+        radix = radix_enum(fields.radix)
+        hidden = bool(fields.hidden)
+        external_access = external_access_enum(fields.access)
 
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record FROM comps WHERE object_id="
-            + str(data_type_id)
+            + str(fields.type_id)
         )
         data_type_results = self._cur.fetchall()
         data_type = data_type_results[0][0]
@@ -1787,8 +1803,8 @@ class MemberBuilder(L5xElementBuilder):
         target: Union[str, None] = None
         bit_number: Union[int, None] = None
         if data_type == "BOOL":
-            target_key = struct.unpack_from("<I", self.record, 0x6C)[0]
-            val_68 = struct.unpack_from("<I", self.record, 0x68)[0]
+            target_key = fields.target_key
+            val_68 = fields.host
             if target_key != 0xFFFFFFFF:
                 # Pattern 1: direct backing-field reference via offset-60 map
                 data_type = "BIT"
@@ -1796,22 +1812,21 @@ class MemberBuilder(L5xElementBuilder):
                 # size — force dimension to 0 so _member_decorated_xml treats this as
                 # a scalar rather than emitting thousands of <Element> entries.
                 dimension = 0
-                bit_number = struct.unpack_from("<I", self.record, 0x64)[0]
+                bit_number = fields.bit
                 target = self._offset60_to_name.get(target_key)
             elif val_68 == 0:
                 # Pattern 2: BIT member without explicit backing-field pointer
                 data_type = "BIT"
                 dimension = 0  # same bit-offset field; not an array size
-                bit_number = struct.unpack_from("<I", self.record, 0x64)[0]
+                bit_number = fields.bit
                 target = self._fallback_target
             elif val_68 == 1:
                 # Pattern 3: BIT member — 0x60 of this member equals 0x60 of the backing
                 # hidden field, allowing direct lookup in offset60_to_name.
                 data_type = "BIT"
                 dimension = 0
-                bit_number = struct.unpack_from("<I", self.record, 0x64)[0]
-                val_60 = struct.unpack_from("<I", self.record, 0x60)[0]
-                target = self._offset60_to_name.get(val_60)
+                bit_number = fields.bit
+                target = self._offset60_to_name.get(fields.offset)
 
         # --- Description ---
         # The member's description is identified in the comments table by a
@@ -1833,8 +1848,8 @@ class MemberBuilder(L5xElementBuilder):
 
         return Member(
             name, name, data_type, dimension, radix, hidden, target, bit_number, external_access, description,
-            _offset=struct.unpack_from("<I", self.record, 0x60)[0],
-            _bit=struct.unpack_from("<I", self.record, 0x64)[0],
+            _offset=fields.offset,
+            _bit=fields.bit,
         )
 
 
@@ -1956,10 +1971,9 @@ class DataTypeBuilder(L5xElementBuilder):
         These types have no member objects in Comps; each member is a record
         inside the type's own record, at attribute 0x6E + index. The record
         starts with the member name (UTF-16LE, NUL-terminated, 0x54 bytes)
-        and then uses the same offsets as a current-layout member record:
-        radix 0x54, type object 0x58, dimension 0x5C, byte offset 0x60, bit
-        0x64, hidden 0x70, external access 0x74. For a BIT member 0x68 is
-        the index of its host member (0x800 for any other member).
+        and then has the same fields as a current-layout member record (see
+        _member_fields). For a BIT member the host field is the index of its
+        host member (0x800 for any other member).
         """
         records = []
         for idx in range(member_count):
@@ -1971,21 +1985,20 @@ class DataTypeBuilder(L5xElementBuilder):
 
         members: List[Member] = []
         for rec, name in zip(records, names):
-            radix, type_id, dimension, offset, bit, host, _, hidden, access = struct.unpack_from(
-                "<9I", rec, 0x54
-            )
-            self._cur.execute("SELECT comp_name FROM comps WHERE object_id=?", (type_id,))
+            fields = _member_fields(rec)
+            self._cur.execute("SELECT comp_name FROM comps WHERE object_id=?", (fields.type_id,))
             row = self._cur.fetchone()
             data_type = row[0] if row else ""
+            dimension = fields.dimension
             target: Union[str, None] = None
             bit_number: Union[int, None] = None
-            if data_type == "BOOL" and host != 0x800 and host < len(names):
+            if data_type == "BOOL" and fields.host != 0x800 and fields.host < len(names):
                 data_type, dimension = "BIT", 0
-                target, bit_number = names[host], bit
+                target, bit_number = names[fields.host], fields.bit
             members.append(Member(
-                name, name, data_type, dimension, radix_enum(radix), bool(hidden),
-                target, bit_number, external_access_enum(access),
-                _offset=offset, _bit=bit,
+                name, name, data_type, dimension, radix_enum(fields.radix), bool(fields.hidden),
+                target, bit_number, external_access_enum(fields.access),
+                _offset=fields.offset, _bit=fields.bit,
             ))
         return members
 
@@ -2735,12 +2748,11 @@ class TagBuilder(L5xElementBuilder):
             data_type_results = self._cur.fetchall()
             data_type = data_type_results[0][0] if data_type_results else ""
 
-        alias_name = results[0][0]
+        # The name is in ext[0x01] (u16 length, then utf-8), else comp_name.
+        name = results[0][0]
         if len(extended_records.get(0x01, b"")) >= 2:
             name_length = struct.unpack("<H", extended_records[0x01][0:2])[0]
-            alias_name = bytes(extended_records[0x01][2 : name_length + 2]).decode(
-                "utf-8", errors="replace"
-            )
+            name = extended_records[0x01][2 : name_length + 2].decode("utf-8", errors="replace")
         alias_for = None
         if 0x65 in extended_records:
             # Current-layout alias tags keep the same @<object id>@ path as
@@ -2749,13 +2761,13 @@ class TagBuilder(L5xElementBuilder):
                 alias_for = self._legacy_alias_for(extended_records[0x65])
             except ValueError as e:
                 log.warning(
-                    f"Tag '{alias_name}': couldn't resolve its alias target ({e}) -- "
+                    f"Tag '{name}': couldn't resolve its alias target ({e}) -- "
                     "exporting it as a Base tag instead"
                 )
         if alias_for:
             return Tag(
-                alias_name,
-                alias_name,
+                name,
+                name,
                 "Alias",
                 None,
                 radix_enum(r.main_record.radix),
@@ -2767,44 +2779,21 @@ class TagBuilder(L5xElementBuilder):
                 alias_for=alias_for,
             )
 
-        if 0x01 not in extended_records:
-            # Name comes from comp_name in the database; radix from main_record
-            raw_radix = r.main_record.radix
-            radix = radix_enum(raw_radix)
-            dim_parts = []
-            if r.main_record.dimension_1 != 0:
-                dim_parts.append(str(r.main_record.dimension_1))
-            if r.main_record.dimension_2 != 0:
-                dim_parts.append(str(r.main_record.dimension_2))
-            if r.main_record.dimension_3 != 0:
-                dim_parts.append(str(r.main_record.dimension_3))
-            dimensions = ",".join(dim_parts) if dim_parts else None
-            return Tag(
-                results[0][0], results[0][0], "Base", data_type, radix,
-                external_access, constant, dimensions, r.main_record.data_table_instance,
-                comment_results,
+        dimensions = ",".join(
+            str(dimension)
+            for dimension in (
+                r.main_record.dimension_1,
+                r.main_record.dimension_2,
+                r.main_record.dimension_3,
             )
-
-        name_length = struct.unpack("<H", extended_records[0x01][0:2])[0]
-        name = bytes(extended_records[0x01][2 : name_length + 2]).decode("utf-8", errors="replace")
-
-        raw_radix = r.main_record.radix
-        radix = radix_enum(raw_radix)
-
-        dim_parts = []
-        if r.main_record.dimension_1 != 0:
-            dim_parts.append(str(r.main_record.dimension_1))
-        if r.main_record.dimension_2 != 0:
-            dim_parts.append(str(r.main_record.dimension_2))
-        if r.main_record.dimension_3 != 0:
-            dim_parts.append(str(r.main_record.dimension_3))
-        dimensions = ",".join(dim_parts) if dim_parts else None
+            if dimension
+        ) or None
         return Tag(
             name,
             name,
             "Base",
             data_type,
-            radix,
+            radix_enum(r.main_record.radix),
             external_access,
             constant,
             dimensions,
