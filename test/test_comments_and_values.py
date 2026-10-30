@@ -177,3 +177,28 @@ def test_decorated_size_mismatch_falls_back():
 
 def test_logix_string_escapes():
     assert _logix_string(b"a\r\n") == "'a$0D$0A'"
+
+
+def test_decorated_udt_value():
+    from acd.l5x.elements import DataType, Member
+
+    def member(name, dt, offset, bit=0, hidden=False, dim=0):
+        return Member(name, name, dt, dim, "Decimal", hidden, None, None, "Read/Write",
+                      _offset=offset, _bit=bit)
+
+    udt = DataType("Seat", "Seat", "NoFamily", "User", [
+        member("ZZZZZZZZZZSeat0", "SINT", 0, hidden=True),
+        member("Extend", "BIT", 0, bit=0),
+        member("Retract", "BIT", 0, bit=1),
+        member("Pos", "REAL", 4),
+        member("Delay", "TIMER", 8),
+    ], _size=20)
+    data = bytes([0b10, 0, 0, 0]) + struct.pack("<f", 2.5) + struct.pack("<Iii", 0, 500, 0)
+    xml = _decorated_from_data("SEAT", None, data, {"SEAT": udt})
+    assert '<Structure DataType="Seat">' in xml
+    assert 'Name="Extend" DataType="BOOL" Value="0"' in xml
+    assert 'Name="Retract" DataType="BOOL" Value="1"' in xml
+    assert 'Name="Pos" DataType="REAL" Radix="Float" Value="2.5"' in xml
+    assert '<StructureMember Name="Delay" DataType="TIMER">' in xml
+    assert 'Name="PRE" DataType="DINT" Radix="Decimal" Value="500"' in xml
+    assert "ZZZZZZZZZZSeat0" not in xml
