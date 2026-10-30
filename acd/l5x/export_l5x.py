@@ -542,7 +542,10 @@ class ExportL5x:
             in (len(record) - 0x4A, len(record) - 0x4E)
         ):
             identifier_offset = 0x4E
-            entries_length = struct.unpack_from("<I", record, 0x4A)[0] - 4
+            # Everything after the 78-byte prefix is entries: the stored
+            # length leaves out the final four bytes that CompsRecord.parse
+            # keeps, which hold the last entry's object id.
+            entries_length = len(record) - 0x4E
             # Current records can carry a 12-byte non-entry trailer.
             allowed_trailer_lengths = (0, 12)
         else:

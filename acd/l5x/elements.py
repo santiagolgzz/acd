@@ -1749,7 +1749,6 @@ class MemberBuilder(L5xElementBuilder):
         results = self._cur.fetchall()
 
         name = results[0][0]
-        r = RxGeneric.from_bytes(results[0][3])
         try:
             r = RxGeneric.from_bytes(results[0][3])
         except Exception as e:
