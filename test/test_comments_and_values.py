@@ -65,6 +65,20 @@ def test_tag_descriptions_match_reference_export():
     assert descriptions(_controller(project.to_xml())) == expected
 
 
+def test_st_routine_lines_match_reference_export():
+    def st_lines(controller):
+        routine = next(r for r in controller.iter("Routine") if r.get("Name") == "STRoutine")
+        assert routine.get("Type") == "ST"
+        # Rockwell's export puts a newline either side of each CDATA section;
+        # strip that framing so only the source text is compared.
+        return [(line.text or "").strip("\n") for line in routine.find("STContent").findall("Line")]
+
+    project = ImportProjectFromFile(AOI_ACD).import_project()
+    expected = st_lines(ET.parse(AOI_L5X).getroot().find("Controller"))
+    assert len(expected) == 6
+    assert st_lines(_controller(project.to_xml())) == expected
+
+
 def test_l5k_scalar_values():
     assert _l5k_from_data("DINT", struct.pack("<i", -42)) == "-42"
     assert _l5k_from_data("INT", struct.pack("<h", 1234) + bytes(2)) == "1234"
