@@ -509,8 +509,8 @@ def _generate_decorated(dt_base: str, dimensions: Union[str, None],
 
 # Stored tag values (a tag data object's attribute 0x66) are the controller's
 # little-endian memory image of the tag. Only the layouts below are decoded;
-# everything else (scalar BOOLs, which live as bits in a hidden host word, UDTs,
-# AOI instances, module-defined types) keeps the zero defaults above.
+# everything else (UDTs, AOI instances, module-defined types) keeps the zero
+# defaults above.
 _PRIMITIVE_FORMAT: Dict[str, str] = {
     "SINT": "<b", "INT": "<h", "DINT": "<i", "LINT": "<q",
     "USINT": "<B", "UINT": "<H", "UDINT": "<I", "ULINT": "<Q",
@@ -603,7 +603,10 @@ def _struct_value_members_xml(dt_base: str, raw: bytes) -> Union[str, None]:
 
 
 def _l5k_from_data(dt_base: str, data: bytes) -> Union[str, None]:
-    """L5K text for a scalar numeric tag's stored value, or None."""
+    """L5K text for a scalar numeric or BOOL tag's stored value, or None."""
+    if dt_base == "BOOL":
+        # Scalar BOOLs store one byte, 0 or 1.
+        return str(data[0]) if len(data) == 1 and data[0] in (0, 1) else None
     size = _element_size(dt_base)
     if dt_base not in _PRIMITIVE_FORMAT or size is None or not size <= len(data) < size + 8:
         return None
