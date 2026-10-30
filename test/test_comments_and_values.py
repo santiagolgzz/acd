@@ -189,3 +189,22 @@ def test_taginfo_layouts():
 def test_nonfinite_real():
     assert _l5k_from_data("REAL", struct.pack("<f", float("nan"))) == "1.#QNAN000e+000"
     assert _l5k_from_data("REAL", struct.pack("<f", float("-inf"))) == "-1.#INF0000e+000"
+
+
+def _type1_comment(kind: int, text: bytes) -> bytes:
+    # u16 seq, u16 type 1, u16 sub-record length, parent key, member and rung
+    # refs, 5 zero bytes, u32 kind (offset 27), 13 zero bytes, text.
+    body = (
+        struct.pack("<HHHIIi", 0, 1, len(text) + 13, 0x1A2B0068, 0x3C4D006D, 0)
+        + bytes(5) + struct.pack("<I", kind) + bytes(13) + text + b"\0"
+    )
+    return struct.pack("<I", len(body)) + body
+
+
+def test_type1_internal_string_records_are_skipped():
+    from acd.record.comments import CommentsRecord
+
+    real = _dat(_type1_comment(1, b"Made up note"))
+    member_name = _dat(_type1_comment(4, b"SomeMember"))
+    assert CommentsRecord.parse(real)[3] == "Made up note"
+    assert CommentsRecord.parse(member_name) is None

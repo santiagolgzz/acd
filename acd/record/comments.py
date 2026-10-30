@@ -126,6 +126,12 @@ class CommentsRecord:
                     0,              # rung_content
                     0,              # member_ref
                 )
+            # A type-1 record's object_id says what kind of text it holds:
+            # 1 is a user comment; other values are internal strings (member
+            # names, localization metadata) laid out differently, which would
+            # otherwise be read as a truncated description.
+            if r.header.record_type == 0x01 and r.body.object_id != 1:
+                return None
             if r.header.record_type in (0x03, 0x04, 0x0D, 0x0E):
                 tag_ref = r.body.tag_reference.value
             else:
