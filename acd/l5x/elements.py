@@ -202,6 +202,10 @@ class Member(L5xElement):
     bit_number: Union[int, None]  # BIT members only; None omits the attribute
     external_access: str
     _description: Union[str, None] = field(default=None)
+    # Byte offset of the member's data in the structure (for BIT members, of
+    # the host field) and bit number within it, from the member record.
+    _offset: int = 0
+    _bit: int = 0
 
     def to_xml(self) -> str:
         base = super().to_xml()
@@ -219,6 +223,8 @@ class DataType(L5xElement):
     cls: str
     members: List[Member]
     _description: Union[str, None] = field(default=None)
+    # Size of the structure in bytes (Rx attribute 0x65); 0 when unknown.
+    _size: int = 0
 
     def __post_init__(self):
         super().__post_init__()
@@ -509,8 +515,8 @@ def _generate_decorated(dt_base: str, dimensions: Union[str, None],
 
 # Stored tag values (a tag data object's attribute 0x66) are the controller's
 # little-endian memory image of the tag. Only the layouts below are decoded;
-# everything else (UDTs, AOI instances, module-defined types) keeps the zero
-# defaults above.
+# everything else (AOI instances, types without a known size, and the types in
+# _SKIP_DECORATED) keeps the zero defaults above.
 _PRIMITIVE_FORMAT: Dict[str, str] = {
     "SINT": "<b", "INT": "<h", "DINT": "<i", "LINT": "<q",
     "USINT": "<B", "UINT": "<H", "UDINT": "<I", "ULINT": "<Q",
@@ -530,7 +536,8 @@ _STRING_SIZE = 88
 _STRING_DATA_LEN = 82
 
 
-def _element_size(dt_base: str) -> Union[int, None]:
+def _element_size(dt_base: str,
+                  data_types_map: Union[Dict[str, "DataType"], None] = None) -> Union[int, None]:
     fmt = _PRIMITIVE_FORMAT.get(dt_base)
     if fmt is not None:
         return struct.calcsize(fmt)
@@ -538,7 +545,99 @@ def _element_size(dt_base: str) -> Union[int, None]:
         return 12
     if dt_base == "STRING":
         return _STRING_SIZE
+    dt_obj = (data_types_map or {}).get(dt_base)
+    if dt_obj is not None and dt_obj._size and dt_base not in _SKIP_DECORATED:
+        return dt_obj._size
     return None
+
+
+def _type_name(dt_base: str, data_types_map: Union[Dict[str, "DataType"], None]) -> str:
+    """The declared spelling of a type name (map keys are upper-cased)."""
+    dt_obj = (data_types_map or {}).get(dt_base)
+    return dt_obj.name if dt_obj is not None else dt_base
+
+
+def _value_inner_xml(dt_base: str, raw: bytes,
+                     data_types_map: Dict[str, "DataType"]) -> Union[str, None]:
+    """Members XML of one structure value (built-in or user type), or None."""
+    if dt_base in _BUILTIN_STRUCT_BITS or dt_base == "STRING":
+        return _struct_value_members_xml(dt_base, raw)
+    dt_obj = data_types_map.get(dt_base)
+    if dt_obj is None or dt_base in _SKIP_DECORATED or not dt_obj._size:
+        return None
+    parts = []
+    for member in dt_obj.members:
+        if member.hidden:
+            continue
+        fragment = _member_value_xml(member, raw, data_types_map)
+        if fragment is None:
+            return None
+        parts.append(fragment)
+    return "".join(parts)
+
+
+def _member_value_xml(member: "Member", raw: bytes,
+                      data_types_map: Dict[str, "DataType"]) -> Union[str, None]:
+    mdt = member.data_type.upper()
+    name, offset, dim = member.name, member._offset, member.dimension
+
+    def bit_value(bit_index: int) -> Union[str, None]:
+        byte = offset + bit_index // 8
+        return str((raw[byte] >> (bit_index % 8)) & 1) if byte < len(raw) else None
+
+    if mdt in ("BIT", "BOOL") and dim == 0:
+        value = bit_value(member._bit)
+        if value is None:
+            return None
+        return f'<DataValueMember Name="{name}" DataType="BOOL" Value="{value}"/>'
+
+    if dim > 0 and mdt == "BOOL":
+        # BOOL array members are packed 32 to a DINT.
+        values = [bit_value(i) for i in range(dim)]
+        if None in values:
+            return None
+        elems = "".join(f'<Element Index="[{i}]" Value="{v}"/>' for i, v in enumerate(values))
+        return (
+            f'<ArrayMember Name="{name}" DataType="BOOL" Dimensions="{dim}" Radix="Decimal">'
+            f'{elems}</ArrayMember>'
+        )
+
+    size = _element_size(mdt, data_types_map)
+    if size is None or offset + size * max(dim, 1) > len(raw):
+        return None
+
+    def element(i: int) -> Union[str, None]:
+        chunk = raw[offset + i * size : offset + (i + 1) * size]
+        if mdt in _PRIMITIVE_FORMAT:
+            return _format_number(mdt, chunk, l5k=False)
+        return _value_inner_xml(mdt, chunk, data_types_map)
+
+    if dim == 0:
+        value = element(0)
+        if value is None:
+            return None
+        if mdt in _PRIMITIVE_FORMAT:
+            return (
+                f'<DataValueMember Name="{name}" DataType="{mdt}" '
+                f'Radix="{_PRIMITIVE_RADIX[mdt]}" Value="{value}"/>'
+            )
+        return f'<StructureMember Name="{name}" DataType="{_type_name(mdt, data_types_map)}">{value}</StructureMember>'
+
+    values = [element(i) for i in range(dim)]
+    if None in values:
+        return None
+    if mdt in _PRIMITIVE_FORMAT:
+        elems = "".join(f'<Element Index="[{i}]" Value="{v}"/>' for i, v in enumerate(values))
+        return (
+            f'<ArrayMember Name="{name}" DataType="{mdt}" Dimensions="{dim}" '
+            f'Radix="{_PRIMITIVE_RADIX[mdt]}">{elems}</ArrayMember>'
+        )
+    type_name = _type_name(mdt, data_types_map)
+    elems = "".join(
+        f'<Element Index="[{i}]"><Structure DataType="{type_name}">{v}</Structure></Element>'
+        for i, v in enumerate(values)
+    )
+    return f'<ArrayMember Name="{name}" DataType="{type_name}" Dimensions="{dim}">{elems}</ArrayMember>'
 
 
 def _format_number(dt_base: str, raw: bytes, l5k: bool) -> str:
@@ -613,8 +712,8 @@ def _l5k_from_data(dt_base: str, data: bytes) -> Union[str, None]:
     return _format_number(dt_base, data[:size], l5k=True)
 
 
-def _decorated_from_data(dt_base: str, dimensions: Union[str, None],
-                         data: bytes) -> Union[str, None]:
+def _decorated_from_data(dt_base: str, dimensions: Union[str, None], data: bytes,
+                         data_types_map: Union[Dict[str, "DataType"], None] = None) -> Union[str, None]:
     """<Data Format="Decorated"> holding a tag's stored values, or None.
 
     None means the type is not decoded or the data size does not match the
@@ -635,7 +734,7 @@ def _decorated_from_data(dt_base: str, dimensions: Union[str, None],
             return None
         size = 0
     else:
-        size = _element_size(dt_base)
+        size = _element_size(dt_base, data_types_map)
         if size is None or not size * total <= len(data) < size * total + 8:
             return None
 
@@ -645,10 +744,10 @@ def _decorated_from_data(dt_base: str, dimensions: Union[str, None],
         return _format_number(dt_base, data[i * size : (i + 1) * size], l5k=False)
 
     if not dim_parts:
-        inner = _struct_value_members_xml(dt_base, data[:size])
+        inner = _value_inner_xml(dt_base, data[:size], data_types_map or {})
         if inner is None:
             return None
-        body = f'<Structure DataType="{dt_base}">{inner}</Structure>'
+        body = f'<Structure DataType="{_type_name(dt_base, data_types_map)}">{inner}</Structure>'
         return f'<Data Format="Decorated">\n{body}\n</Data>'
 
     elements = []
@@ -661,11 +760,11 @@ def _decorated_from_data(dt_base: str, dimensions: Union[str, None],
         if dt_base == "BOOL" or dt_base in _PRIMITIVE_FORMAT:
             elements.append(f'<Element Index="{idx}" Value="{element_value(i)}"/>')
         else:
-            inner = _struct_value_members_xml(dt_base, data[i * size : (i + 1) * size])
+            inner = _value_inner_xml(dt_base, data[i * size : (i + 1) * size], data_types_map or {})
             if inner is None:
                 return None
             elements.append(
-                f'<Element Index="{idx}"><Structure DataType="{dt_base}">{inner}</Structure></Element>'
+                f'<Element Index="{idx}"><Structure DataType="{_type_name(dt_base, data_types_map)}">{inner}</Structure></Element>'
             )
     dim_str = ",".join(str(d) for d in dim_parts)
     if dt_base == "BOOL":
@@ -673,7 +772,7 @@ def _decorated_from_data(dt_base: str, dimensions: Union[str, None],
     elif dt_base in _PRIMITIVE_FORMAT:
         attrs = f'DataType="{dt_base}" Dimensions="{dim_str}" Radix="{_PRIMITIVE_RADIX[dt_base]}"'
     else:
-        attrs = f'DataType="{dt_base}" Dimensions="{dim_str}"'
+        attrs = f'DataType="{_type_name(dt_base, data_types_map)}" Dimensions="{dim_str}"'
     return f'<Data Format="Decorated">\n<Array {attrs}>{"".join(elements)}</Array>\n</Data>'
 
 
@@ -782,7 +881,9 @@ class Tag(L5xElement):
         data_xml = f'<Data Format="L5K">\n{l5k_zero}\n</Data>' if l5k_zero is not None else ""
 
         if not data_xml and self._data and not self.alias_for:
-            data_xml = _decorated_from_data(dt_base, self.dimensions, self._data) or ""
+            data_xml = (
+                _decorated_from_data(dt_base, self.dimensions, self._data, self._data_types_map) or ""
+            )
 
         if not data_xml and dt_base not in _SKIP_DECORATED and dt_base != "STRING":
             # Generate Decorated data for non-primitive / array types
@@ -1471,7 +1572,11 @@ class MemberBuilder(L5xElementBuilder):
                 if desc_row and desc_row[0]:
                     description = desc_row[0]
 
-        return Member(name, name, data_type, dimension, radix, hidden, target, bit_number, external_access, description)
+        return Member(
+            name, name, data_type, dimension, radix, hidden, target, bit_number, external_access, description,
+            _offset=struct.unpack_from("<I", self.record, 0x60)[0],
+            _bit=struct.unpack_from("<I", self.record, 0x64)[0],
+        )
 
 
 @dataclass
@@ -1579,7 +1684,12 @@ class DataTypeBuilder(L5xElementBuilder):
         if desc_row and desc_row[0]:
             description = desc_row[0]
 
-        return DataType(name, name, string_family, class_type, children, description)
+        size = (
+            struct.unpack("<I", extended_records[0x65])[0]
+            if len(extended_records.get(0x65, b"")) == 4
+            else 0
+        )
+        return DataType(name, name, string_family, class_type, children, description, _size=size)
 
 
 @dataclass
