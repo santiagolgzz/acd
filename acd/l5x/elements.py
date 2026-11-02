@@ -18,6 +18,13 @@ from acd.l5x.conversion_notes import ConversionNotes, xml_comment
 from acd.l5x.port_structures import PORT_STRUCTURES
 from acd.record.rx import LegacyRxGeneric, RxGeneric
 
+# Comment rows that hold user text. A type-1 row's object_id says what it
+# holds: 1 is a user comment; other values are internal strings (member
+# names, localization metadata) laid out differently, which would otherwise
+# be read as a truncated description. Only the older rung-comment layout,
+# which numbers rungs in object_id, reads type-1 rows without this filter.
+_USER_COMMENT = "(record_type != 1 OR object_id = 1)"
+
 
 # Characters that are illegal in XML 1.0: everything outside
 # #x9 | #xA | #xD | #x20-#xD7FF | #xE000-#xFFFD | #x10000-#x10FFFF.
@@ -1300,7 +1307,7 @@ class MemberBuilder(L5xElementBuilder):
             member_ref = struct.unpack_from("<I", raw_comps, 14)[0]
             if member_ref:
                 self._cur.execute(
-                    "SELECT record_string FROM comments WHERE parent=? AND member_ref=? LIMIT 1",
+                    f"SELECT record_string FROM comments WHERE parent=? AND member_ref=? AND {_USER_COMMENT} LIMIT 1",
                     ((r.comment_id * 0x10000) + r.cip_type, member_ref),
                 )
                 desc_row = self._cur.fetchone()
@@ -1424,7 +1431,7 @@ class DataTypeBuilder(L5xElementBuilder):
         # --- Description ---
         description: Union[str, None] = None
         self._cur.execute(
-            "SELECT record_string FROM comments WHERE parent=? AND member_ref=0 LIMIT 1",
+            f"SELECT record_string FROM comments WHERE parent=? AND member_ref=0 AND {_USER_COMMENT} LIMIT 1",
             ((r.comment_id * 0x10000) + r.cip_type,),
         )
         desc_row = self._cur.fetchone()
@@ -1670,7 +1677,7 @@ class ModuleBuilder(L5xElementBuilder):
         # (comment_id * 0x10000 + cip_type), same as for tags.
         description = ""
         self._cur.execute(
-            "SELECT record_string FROM comments WHERE parent=? AND member_ref=0 LIMIT 1",
+            f"SELECT record_string FROM comments WHERE parent=? AND member_ref=0 AND {_USER_COMMENT} LIMIT 1",
             ((r.comment_id * 0x10000) + r.cip_type,),
         )
         desc_row = self._cur.fetchone()
@@ -2017,13 +2024,14 @@ class TagBuilder(L5xElementBuilder):
             # Program tag: only the comments filed under this tag's own key,
             # not every comment in the program's scope.
             self._cur.execute(
-                "SELECT tag_reference, record_string FROM comments WHERE parent=? AND member_ref=?",
+                f"SELECT tag_reference, record_string FROM comments WHERE parent=? AND member_ref=? AND {_USER_COMMENT}",
                 (scope_key, member_key),
             )
         else:
             self._cur.execute(
                 "SELECT tag_reference, record_string FROM comments WHERE parent="
                 + str((r.comment_id * 0x10000) + r.cip_type)
+                + f" AND {_USER_COMMENT}"
             )
         comment_results = self._cur.fetchall()
 
@@ -2279,7 +2287,7 @@ class ParameterBuilder(L5xElementBuilder):
             member_ref = struct.unpack_from("<I", raw_rec, 14)[0]
             if member_ref:
                 self._cur.execute(
-                    "SELECT record_string FROM comments WHERE parent=? AND member_ref=? LIMIT 1",
+                    f"SELECT record_string FROM comments WHERE parent=? AND member_ref=? AND {_USER_COMMENT} LIMIT 1",
                     ((r.comment_id * 0x10000) + r.cip_type, member_ref),
                 )
                 desc_row = self._cur.fetchone()
@@ -2352,7 +2360,7 @@ class LocalTagBuilder(L5xElementBuilder):
             member_ref = struct.unpack_from("<I", raw_rec, 14)[0]
             if member_ref:
                 self._cur.execute(
-                    "SELECT record_string FROM comments WHERE parent=? AND member_ref=? LIMIT 1",
+                    f"SELECT record_string FROM comments WHERE parent=? AND member_ref=? AND {_USER_COMMENT} LIMIT 1",
                     ((r.comment_id * 0x10000) + r.cip_type, member_ref),
                 )
                 desc_row = self._cur.fetchone()
@@ -2473,7 +2481,8 @@ class RoutineBuilder(L5xElementBuilder):
             if index_by_uid:
                 self._cur.execute(
                     "SELECT rung_content, record_string FROM comments "
-                    "WHERE parent=? AND member_ref=? AND record_type=1 AND rung_content!=0",
+                    "WHERE parent=? AND member_ref=? AND record_type=1 AND rung_content!=0 "
+                    f"AND {_USER_COMMENT}",
                     (scope_key, member_key),
                 )
                 for rung_content, rec_str in self._cur.fetchall():
@@ -2703,7 +2712,7 @@ class AoiBuilder(L5xElementBuilder):
         if _r_aoi is not None:
             aoi_comment_parent = (_r_aoi.comment_id * 0x10000) + _r_aoi.cip_type
             self._cur.execute(
-                "SELECT record_string FROM comments WHERE parent=? AND member_ref=0 LIMIT 1",
+                f"SELECT record_string FROM comments WHERE parent=? AND member_ref=0 AND {_USER_COMMENT} LIMIT 1",
                 (aoi_comment_parent,),
             )
             desc_row = self._cur.fetchone()
@@ -2821,6 +2830,7 @@ class ProgramBuilder(L5xElementBuilder):
         self._cur.execute(
             "SELECT tag_reference, record_string FROM comments WHERE parent="
             + str((r.comment_id * 0x10000) + r.cip_type)
+            + f" AND {_USER_COMMENT}"
         )
         comment_results = self._cur.fetchall()
 
@@ -2947,6 +2957,7 @@ class ControllerBuilder(L5xElementBuilder):
         self._cur.execute(
             "SELECT tag_reference, record_string FROM comments WHERE parent="
             + str((r.comment_id * 0x10000) + r.cip_type)
+            + f" AND {_USER_COMMENT}"
         )
         comment_results = self._cur.fetchall()
 

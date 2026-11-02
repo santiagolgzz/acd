@@ -85,6 +85,10 @@ class CommentsRecord:
                     0,              # rung_content
                     0,              # member_ref
                 )
+            # A type-1 record's object_id says what kind of text it holds: 1
+            # is a user comment; other values are internal strings, except in
+            # older rung comments, where it is the rung number. The record is
+            # kept; readers filter on object_id (elements._USER_COMMENT).
             if r.header.record_type in (0x03, 0x04, 0x0D, 0x0E):
                 tag_ref = r.body.tag_reference.value
             else:

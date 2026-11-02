@@ -1,10 +1,13 @@
 import os
+import sqlite3
 import struct
 import xml.etree.ElementTree as ET
+from types import SimpleNamespace
 
 from acd.api import ImportProjectFromFile
-from acd.l5x.elements import scoped_comment_keys
+from acd.l5x.elements import _USER_COMMENT, scoped_comment_keys
 from acd.l5x.export_l5x import ExportL5x
+from acd.record.comments import CommentsRecord
 
 AOI_ACD = os.path.join("..", "resources", "ACDTestsWithAOI.ACD")
 AOI_L5X = os.path.join("..", "resources", "ACDTestsWithAOI.L5X")
@@ -71,3 +74,39 @@ def test_tag_descriptions_match_reference_export():
     project = ImportProjectFromFile(AOI_ACD).import_project()
     expected = descriptions(ET.parse(AOI_L5X).getroot().find("Controller"))
     assert descriptions(_controller(project.to_xml())) == expected
+
+
+def _dat(buf: bytes):
+    return SimpleNamespace(identifier=64250, record=SimpleNamespace(record_buffer=buf))
+
+
+def _type1_comment(kind: int, text: bytes) -> bytes:
+    # u16 seq, u16 type 1, u16 sub-record length, parent key, member and rung
+    # refs, 5 zero bytes, u32 kind (offset 27), 13 zero bytes, text.
+    body = (
+        struct.pack("<HHHIIi", 0, 1, len(text) + 13, 0x1A2B0068, 0x3C4D006D, 0)
+        + bytes(5) + struct.pack("<I", kind) + bytes(13) + text + b"\0"
+    )
+    return struct.pack("<I", len(body)) + body
+
+
+def test_type1_internal_string_records_are_left_out_of_descriptions():
+    real = CommentsRecord.parse(_dat(_type1_comment(1, b"Made up note")))
+    member_name = CommentsRecord.parse(_dat(_type1_comment(4, b"SomeMember")))
+    assert real is not None and member_name is not None
+    assert (real[2], real[3]) == (1, "Made up note")
+    # Kept in the table (older rung comments number rungs in object_id) ...
+    assert (member_name[2], member_name[3]) == (4, "SomeMember")
+
+    # ... but never read as a description.
+    db = sqlite3.connect(":memory:")
+    cur = db.cursor()
+    cur.execute("CREATE TABLE comments(seq_number int, sub_record_length int, object_id int, record_string text,"
+                " record_type int, parent int, tag_reference text, rung_content int, member_ref int)")
+    cur.executemany("INSERT INTO comments VALUES (?,?,?,?,?,?,?,?,?)", [member_name, real])
+    cur.execute(
+        f"SELECT record_string FROM comments WHERE parent=? AND member_ref=? AND {_USER_COMMENT} LIMIT 1",
+        (0x1A2B0068, 0x3C4D006D),
+    )
+    assert cur.fetchall() == [("Made up note",)]
+    db.close()
