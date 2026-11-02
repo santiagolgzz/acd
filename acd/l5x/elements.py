@@ -910,6 +910,52 @@ def taginfo_tags(root: ET.Element) -> List[Tuple[str, str, str]]:
     return [row for row in rows if row[1] and row[2]]
 
 
+def taginfo_layouts(root: ET.Element) -> Dict[str, "DataType"]:
+    """Type layouts (size, member offsets and bits) from a project's TagInfo.XML.
+
+    TagInfo.XML lists every type the project uses, including Add-On
+    Instructions and module-defined types, with byte offsets. Only the
+    layout is kept; it is used to decode stored tag values, not exported.
+    """
+    layouts: Dict[str, DataType] = {}
+    for dt in root.iter("DataType"):
+        try:
+            members = []
+            for m in dt.findall("Members/Member"):
+                dims = [int(d.get("Size", "0")) for d in m.findall("Dimensions/Dim")]
+                dim = 1
+                for d in dims:
+                    dim *= d
+                bit = m.get("Bit")
+                members.append(Member(
+                    m.get("Name"), m.get("Name"), m.get("DataType", ""), dim if dims else 0,
+                    "Decimal", m.get("Hidden") == "true", None,
+                    int(bit) if bit is not None else None, "Read/Write",
+                    _offset=int(m.get("Offset", "0")), _bit=int(bit) if bit is not None else 0,
+                ))
+            size = int(dt.get("Size", "0"))
+        except ValueError:
+            # An empty or non-numeric size, offset or bit: the layout is
+            # unusable, so the type is decoded as if TagInfo.XML lacked it.
+            continue
+        name = dt.get("Name", "")
+        layouts[name.upper()] = DataType(
+            name, name, "NoFamily", "User", members, _size=size
+        )
+    return layouts
+
+
+def merge_value_types(data_types_map: Dict[str, "DataType"],
+                      taginfo: Dict[str, "DataType"]) -> Dict[str, "DataType"]:
+    """Types for value decoding: the Comps-derived type where it has a size
+    and members, otherwise the TagInfo.XML layout."""
+    merged = dict(taginfo)
+    for key, dt in data_types_map.items():
+        if dt._size and dt.members:
+            merged[key] = dt
+    return merged
+
+
 @dataclass
 class ProduceInfo(L5xElement):
     produce_count: str
@@ -960,6 +1006,9 @@ class Tag(L5xElement):
     consume_info: Union[ConsumeInfo, None] = None
     # Raw stored value from the tag's data object; None when not found.
     _data: Union[bytes, None] = None
+    # Type layouts used to decode _data (see merge_value_types); falls back to
+    # _data_types_map when empty.
+    _value_types_map: Dict[str, "DataType"] = field(default_factory=dict)
     # Program parameter usage (Input, Output, InOut, Public); None for others.
     usage: Union[str, None] = None
 
@@ -1074,7 +1123,10 @@ class Tag(L5xElement):
 
         if not data_xml and self._data and not self.alias_for:
             data_xml = (
-                _decorated_from_data(dt_base, self.dimensions, self._data, self._data_types_map) or ""
+                _decorated_from_data(
+                    dt_base, self.dimensions, self._data, self._value_types_map or self._data_types_map
+                )
+                or ""
             )
 
         if not data_xml and dt_base not in _SKIP_DECORATED and dt_base != "STRING":
@@ -2554,10 +2606,12 @@ class TagBuilder(L5xElementBuilder):
         tag = self._build()
         r = self._record
         if r is not None:
-            if not isinstance(r, LegacyRxGeneric):
-                data = self._data_object_value(tag._data_table_instance)
-                if data is not None:
-                    tag._data = data
+            # A legacy tag names its data object at the start of its record.
+            data = self._data_object_value(
+                r.data_instance_id if isinstance(r, LegacyRxGeneric) else tag._data_table_instance
+            )
+            if data is not None:
+                tag._data = data
             tag.usage = _program_tag_usage(r)
         if not tag.data_type and tag.tag_type != "Alias":
             tag.data_type = self._taginfo_data_type(tag.name) or tag.data_type
@@ -3431,6 +3485,7 @@ _SYSTEM_TAG_RECORD_TYPE = 264
 class ProgramBuilder(L5xElementBuilder):
     _data_types_map: Dict[str, "DataType"] = field(default_factory=dict)
     _redundancy_enabled: bool = field(default=False)
+    _value_types_map: Dict[str, "DataType"] = field(default_factory=dict)
 
     def build(self) -> Program:
         self._cur.execute(
@@ -3523,6 +3578,7 @@ class ProgramBuilder(L5xElementBuilder):
                 # name; only shadows (which carry a user name) are exported.
                 continue
             tag._data_types_map = self._data_types_map
+            tag._value_types_map = self._value_types_map
             tags.append(tag)
 
         self._cur.execute(
@@ -3642,6 +3698,8 @@ class ControllerBuilder(L5xElementBuilder):
     # Optional richer CIP-identity -> catalog-number table for resolving module
     # CatalogNumbers and the controller ProcessorType. None -> built-in only.
     _catalog_table: Union[Dict[Tuple[int, int, int], str], None] = None
+    # Type layouts from the project's TagInfo.XML (see taginfo_layouts).
+    _taginfo_layouts: Dict[str, "DataType"] = field(default_factory=dict)
 
     def build(self) -> Controller:
         self._cur.execute(
@@ -3771,6 +3829,7 @@ class ControllerBuilder(L5xElementBuilder):
         # data_types_map: case-insensitive name → DataType for all types (User + ProductDefined).
         # Used by Tag.to_xml() when generating Decorated XML.
         data_types_map: Dict[str, DataType] = all_data_types_map
+        value_types_map = merge_value_types(data_types_map, self._taginfo_layouts)
 
         # Get the Controller Scoped Tags
         self._cur.execute(
@@ -3816,6 +3875,7 @@ class ControllerBuilder(L5xElementBuilder):
                 )
                 continue
             tag._data_types_map = data_types_map
+            tag._value_types_map = value_types_map
             if (
                 (tag.data_type or tag.tag_type == "Alias")
                 and not tag.name.startswith("$")
@@ -3840,7 +3900,9 @@ class ControllerBuilder(L5xElementBuilder):
         for result in program_records:
             _program_object_id = result[1]
             programs.append(
-                ProgramBuilder(self._cur, _program_object_id, data_types_map, redundancy_enabled).build()
+                ProgramBuilder(
+                    self._cur, _program_object_id, data_types_map, redundancy_enabled, value_types_map
+                ).build()
             )
 
         # Build task schedule ID → program name map. Legacy projects keep this

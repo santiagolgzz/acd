@@ -10,7 +10,10 @@ from acd.l5x.elements import (
     DataTypeBuilder,
     RoutineBuilder,
     TagBuilder,
+    _decorated_from_data,
     _own_description,
+    merge_value_types,
+    taginfo_layouts,
     taginfo_tags,
 )
 from acd.record.comments import CommentsRecord
@@ -263,4 +266,78 @@ def test_legacy_controller_description_through_controller_builder():
     _comment(cur, CONTROLLER_OWN_KEY, 0, "Line 4 filler")
     controller = ControllerBuilder(cur).build()
     assert "<Description>\n<![CDATA[Line 4 filler]]>\n</Description>" in controller.to_xml()
+    db.close()
+
+
+SEAT_TAGINFO = (
+    '<LogixTagInfo><DataTypes><DataType Name="Seat" Size="12"><Members>'
+    '<Member Name="ZZZZZZZZZZSeat0" DataType="SINT" Offset="0" Hidden="true"/>'
+    '<Member Name="Extend" DataType="BOOL" Offset="0" Bit="1"/>'
+    '<Member Name="Pos" DataType="REAL" Offset="4"><Dimensions><Dim Size="2"/></Dimensions></Member>'
+    '</Members></DataType></DataTypes></LogixTagInfo>'
+)
+SEAT_VALUE = bytes([0b10, 0, 0, 0]) + struct.pack("<ff", 1.5, 2.0)
+
+
+def _tag_with_value(cur, object_id, name, runtime_type, value, parent_id=0):
+    """A legacy tag whose data object (object_id + 1) holds `value`."""
+    record = _legacy_rx(
+        0x6B, object_id, attributes=[(0x01, _metadata(name, runtime_type))],
+        data_instance_id=object_id + 1,
+    )
+    cur.execute("INSERT INTO comps VALUES (?, ?, ?, 0, 0, ?)", (object_id, parent_id, name, record))
+    data_object = _legacy_rx(0x6E, object_id + 1, [(0x66, value)])
+    cur.execute("INSERT INTO comps VALUES (?, 0, 'data', 0, 0, ?)", (object_id + 1, data_object))
+
+
+def test_legacy_tag_value_comes_from_its_data_object():
+    db, cur = _database()
+    _tag_with_value(cur, 0x50, "Count", 0xC4, struct.pack("<i", 42))
+    tag = TagBuilder(cur, 0x50).build()
+    assert tag._data == struct.pack("<i", 42)
+    assert '<Data Format="L5K">\n42\n</Data>' in tag.to_xml()
+    db.close()
+
+
+def test_taginfo_layouts():
+    seat = taginfo_layouts(ET.fromstring(SEAT_TAGINFO))["SEAT"]
+    assert seat._size == 12
+    extend, pos = seat.members[1], seat.members[2]
+    assert (extend._offset, extend._bit, extend.hidden) == (0, 1, False)
+    assert (pos.data_type, pos.dimension, pos._offset) == ("REAL", 2, 4)
+    xml = _decorated_from_data("SEAT", None, SEAT_VALUE, taginfo_layouts(ET.fromstring(SEAT_TAGINFO)))
+    assert 'Name="Extend" DataType="BOOL" Value="1"' in xml
+    assert '<Element Index="[1]" Value="2.0"/>' in xml
+
+
+def test_taginfo_layouts_skip_unusable_sizes_and_offsets():
+    root = ET.fromstring(SEAT_TAGINFO)
+    root.append(ET.fromstring('<DataType Name="NoSize" Size=""/>'))
+    root.append(ET.fromstring(
+        '<DataType Name="BadOffset" Size="4"><Members>'
+        '<Member Name="A" DataType="DINT" Offset="x"/></Members></DataType>'
+    ))
+    assert sorted(taginfo_layouts(root)) == ["SEAT"]
+
+
+def test_merge_value_types_keeps_complete_comps_types():
+    layouts = taginfo_layouts(ET.fromstring(SEAT_TAGINFO))
+    complete = SimpleNamespace(_size=12, members=[object()])
+    empty = SimpleNamespace(_size=0, members=[])
+    assert merge_value_types({"SEAT": complete}, layouts)["SEAT"] is complete
+    assert merge_value_types({"SEAT": empty}, layouts)["SEAT"] is layouts["SEAT"]
+
+
+def test_legacy_tag_values_decode_with_taginfo_layouts():
+    # The Comps type is missing; the controller decodes the value with the
+    # layout from TagInfo.XML.
+    db, cur = _database()
+    _legacy_controller(cur)
+    _tag_with_value(cur, 0x50, "Seat1", 0, SEAT_VALUE, parent_id=3)
+    cur.execute("INSERT INTO taginfo_tags VALUES ('', 'Seat1', 'Seat')")
+    layouts = taginfo_layouts(ET.fromstring(SEAT_TAGINFO))
+    (tag,) = ControllerBuilder(cur, _taginfo_layouts=layouts).build().tags
+    xml = tag.to_xml()
+    assert '<DataValueMember Name="Extend" DataType="BOOL" Value="1"/>' in xml
+    assert '<Element Index="[0]" Value="1.5"/>' in xml
     db.close()

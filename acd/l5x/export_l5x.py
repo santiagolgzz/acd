@@ -20,6 +20,7 @@ from acd.l5x.elements import (
     ControllerBuilder,
     ProjectBuilder,
     RSLogix5000Content,
+    taginfo_layouts,
     taginfo_tags,
 )
 from acd.record.comments import CommentsRecord
@@ -179,6 +180,8 @@ class ExportL5x:
         self._repair_region_map_gaps()
         self.populate_rung_uids()
         taginfo = self._read_taginfo()
+        # Type layouts from TagInfo.XML, for decoding tag values.
+        self._taginfo_layouts = taginfo_layouts(taginfo) if taginfo is not None else {}
         if taginfo is not None:
             self._cur.executemany("INSERT INTO taginfo_tags VALUES (?,?,?)", taginfo_tags(taginfo))
         self._db.commit()
@@ -231,7 +234,8 @@ class ExportL5x:
     def controller(self):
         if self._controller is None:
             self._controller = ControllerBuilder(
-                self._cur, _catalog_table=self._catalog_table
+                self._cur, _catalog_table=self._catalog_table,
+                _taginfo_layouts=self._taginfo_layouts,
             ).build()
         return self._controller
 
