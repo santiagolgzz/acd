@@ -163,7 +163,11 @@ class L5xElement:
     def to_xml(self) -> str:
         attribute_list: List[str] = []
         child_list: List[str] = []
-        for attribute in self.__dict__:
+        # Attributes named in _ATTRIBUTE_ORDER come first, then the rest in field order.
+        order = getattr(self, "_ATTRIBUTE_ORDER", ())
+        ordered = [n for n in order if n in self.__dict__]
+        ordered += [n for n in self.__dict__ if n not in order]
+        for attribute in ordered:
             if attribute[0] != "_":
                 attribute_value = self.__getattribute__(attribute)
                 if attribute_value is None:
@@ -333,6 +337,17 @@ _BUILTIN_STRUCT_MEMBERS: Dict[str, List[Tuple[str, str]]] = {
         ("EN", "BOOL"), ("EU", "BOOL"), ("DN", "BOOL"), ("EM", "BOOL"),
         ("ER", "BOOL"), ("UL", "BOOL"), ("IN", "BOOL"), ("FD", "BOOL"),
     ],
+}
+
+# Control-word bit names (BOOL members, from bit 31 down) and DINT member names
+# (in order) of each built-in struct, derived from _BUILTIN_STRUCT_MEMBERS.
+_BUILTIN_STRUCT_BITS: Dict[str, List[str]] = {
+    name: [m for m, t in members if t == "BOOL"]
+    for name, members in _BUILTIN_STRUCT_MEMBERS.items()
+}
+_BUILTIN_STRUCT_WORDS: Dict[str, List[str]] = {
+    name: [m for m, t in members if t == "DINT"]
+    for name, members in _BUILTIN_STRUCT_MEMBERS.items()
 }
 
 # Types for which we emit no Decorated element at all (they use other formats).
@@ -558,14 +573,6 @@ _TIME_TYPES: Dict[str, Tuple[str, int]] = {
     "TIME": ("T#", 1), "LTIME": ("LT#", 1000), "TIME32": ("T32#", 1),
 }
 
-# Control-word bit names of built-in structs, from bit 31 down. The DINT after
-# the control word is PRE (LEN for CONTROL) and the next one ACC (POS).
-_BUILTIN_STRUCT_BITS: Dict[str, List[str]] = {
-    "TIMER": ["EN", "TT", "DN"],
-    "COUNTER": ["CU", "CD", "DN", "OV", "UN"],
-    "CONTROL": ["EN", "EU", "DN", "EM", "ER", "UL", "IN", "FD"],
-}
-
 # STRING: LEN (DINT) + DATA (SINT[82]) + 2 pad bytes.
 _STRING_SIZE = 88
 _STRING_DATA_LEN = 82
@@ -789,10 +796,10 @@ def _struct_value_members_xml(dt_base: str, raw: bytes) -> Union[str, None]:
         return (
             f'<DataValueMember Name="LEN" DataType="DINT" Radix="Decimal" Value="{length}"/>'
             f'<DataValueMember Name="DATA" DataType="STRING" Radix="ASCII">\n'
-            f'<![CDATA[{text}]]>\n</DataValueMember>'
+            f'{_cdata_section(text)}\n</DataValueMember>'
         )
     control, first, second = struct.unpack_from("<Iii", raw, 0)
-    names = ("LEN", "POS") if dt_base == "CONTROL" else ("PRE", "ACC")
+    names = _BUILTIN_STRUCT_WORDS[dt_base]
     parts = [
         f'<DataValueMember Name="{names[0]}" DataType="DINT" Radix="Decimal" Value="{first}"/>',
         f'<DataValueMember Name="{names[1]}" DataType="DINT" Radix="Decimal" Value="{second}"/>',
@@ -809,8 +816,10 @@ def _l5k_from_data(dt_base: str, data: bytes) -> Union[str, None]:
     if dt_base == "BOOL":
         # Scalar BOOLs store one byte, 0 or 1.
         return str(data[0]) if len(data) == 1 and data[0] in (0, 1) else None
-    size = _element_size(dt_base)
-    if dt_base not in _PRIMITIVE_FORMAT or size is None or not size <= len(data) < size + 8:
+    if dt_base not in _PRIMITIVE_FORMAT:
+        return None
+    size = struct.calcsize(_PRIMITIVE_FORMAT[dt_base])
+    if not size <= len(data) < size + 8:
         return None
     return _format_number(dt_base, data[:size], l5k=True)
 
@@ -1013,11 +1022,6 @@ class Tag(L5xElement):
         # Rockwell writes Constant on every Base tag.
         if self.tag_type == "Base" and self.constant is None:
             self.constant = "false"
-        fields = dict(self.__dict__)
-        self.__dict__.clear()
-        for key in self._ATTRIBUTE_ORDER:
-            self.__dict__[key] = fields.pop(key)
-        self.__dict__.update(fields)
 
     @property
     def _l5x_exclude(self) -> bool:
@@ -1048,16 +1052,15 @@ class Tag(L5xElement):
                 parts.append(f"&#x{cp:04X};")
         return "".join(parts)
 
-    def _data_value_xml(self, dt_base: str) -> str:
+    def _data_value_xml(self, dt_base: str, stored: Union[str, None]) -> str:
         """<Data Format="Decorated"> with the scalar atomic value in the tag's radix.
 
-        The stored value is used when it decodes, otherwise zero (the L5K default).
+        stored is the L5K text of the stored value, or None when it does not decode;
+        zero is used then (the L5K default).
         """
-        size = 1 if dt_base == "BOOL" else _element_size(dt_base)
-        if size is None:
-            return ""
+        size = 1 if dt_base == "BOOL" else struct.calcsize(_PRIMITIVE_FORMAT[dt_base])
         data = self._data or b""
-        raw = data[:size] if _l5k_from_data(dt_base, data) is not None else bytes(size)
+        raw = data[:size] if stored is not None else bytes(size)
         radix = self.radix or _PRIMITIVE_RADIX.get(dt_base, "Decimal")
         value = _radix_value(dt_base, radix, raw)
         type_name = self.data_type.split("[")[0] if self.data_type else dt_base
@@ -1096,17 +1099,20 @@ class Tag(L5xElement):
             ) + "</Comments>"
 
         # --- Data child element(s) ---
-        # Scalar primitives get Format="L5K" only.
-        # Scalar STRING gets Format="L5K" (the L5K encoder handles it separately; we emit
-        # nothing here — Decorated is not used for scalar STRING tags).
-        # Everything else (UDTs, arrays, TIMER, COUNTER, etc.) gets Format="Decorated".
+        # Scalar primitives and BOOL get an L5K value: the stored value when it
+        # decodes, else zero. Unless the tag is an alias, they also get a Decorated
+        # DataValue in the tag's radix. Other tags get Decorated data from the stored
+        # bytes when they decode, else zero defaults. STRING and _SKIP_DECORATED types
+        # get no zero-default element.
         dt_base = self.data_type.split("[")[0].upper() if self.data_type else ""
         l5k_zero = _PRIMITIVE_L5K_ZERO.get(dt_base) if not self.dimensions else None
+        stored = None
         if l5k_zero is not None and self._data and not self.alias_for:
-            l5k_zero = _l5k_from_data(dt_base, self._data) or l5k_zero
+            stored = _l5k_from_data(dt_base, self._data)
+            l5k_zero = stored or l5k_zero
         data_xml = f'<Data Format="L5K">\n{l5k_zero}\n</Data>' if l5k_zero is not None else ""
         if l5k_zero is not None and not self.alias_for:
-            data_xml += self._data_value_xml(dt_base)
+            data_xml += self._data_value_xml(dt_base, stored)
 
         if not data_xml and self._data and not self.alias_for:
             data_xml = (
