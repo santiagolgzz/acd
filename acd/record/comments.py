@@ -61,9 +61,14 @@ class CommentsRecord:
     @staticmethod
     def _utf16z(buf: bytes, pos: int) -> Tuple[str, int]:
         """Read a null-terminated UTF-16LE string; return it and the offset after the null."""
-        end = pos
-        while end + 1 < len(buf) and buf[end : end + 2] != b"\0\0":
-            end += 2
+        # The terminator is a zero code unit at an even offset from pos. Without
+        # one, the text runs to the end of the buffer, rounded up to whole units.
+        end = pos + 2 * ((max(len(buf) - 1 - pos, 0) + 1) // 2)
+        hit = buf.find(b"\0\0", pos)
+        while hit >= 0 and (hit - pos) % 2:
+            hit = buf.find(b"\0\0", hit + 1)
+        if hit >= 0:
+            end = hit
         return buf[pos:end].decode("utf-16-le", errors="replace"), end + 2
 
     @staticmethod
