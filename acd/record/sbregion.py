@@ -2,10 +2,9 @@ import re
 import struct
 from dataclasses import dataclass
 from sqlite3 import Cursor
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 from acd.database.dbextract import DatRecord
-from acd.l5x import conversion_notes
 
 from acd.generated.sbregion.fafa_sbregions import FafaSbregions
 
@@ -44,7 +43,10 @@ class SbRegionRecord:
         return sb_rec
 
     @staticmethod
-    def parse(dat_record: DatRecord, name_lookup: Dict[int, str]) -> Optional[tuple]:
+    def parse(
+        dat_record: DatRecord, name_lookup: Dict[int, str], report: Callable[[str], None]
+    ) -> Optional[tuple]:
+        """The rung's (object_id, text, "") or None; problems go to ``report``."""
         if dat_record.identifier != 64250:
             return None
         r = FafaSbregions.from_bytes(dat_record.record.record_buffer)
@@ -57,7 +59,7 @@ class SbRegionRecord:
             # Keep the rung rather than abort the whole conversion; mark the
             # undecodable bytes and say so in the output (issue #35).
             text = buffer[: len(buffer) // 2 * 2].decode("utf-16-le", errors="replace").rstrip("\x00")
-            conversion_notes.add(
+            report(
                 f"Rung {r.header.identifier}: text is not valid UTF-16; "
                 "undecodable characters are shown as U+FFFD"
             )

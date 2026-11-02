@@ -15,6 +15,7 @@ from typing import Any, List, NamedTuple, Tuple, Dict, Union
 from loguru import logger as log
 
 from acd.l5x import conversion_notes
+from acd.l5x.conversion_notes import ConversionNotes
 from acd.l5x.catalog_numbers import CATALOG_NUMBERS, catalog_number_for_identity
 from acd.l5x.port_structures import PORT_STRUCTURES
 from acd.record.comps import comment_keys
@@ -88,6 +89,8 @@ def _sanitize_path_component(name: str) -> str:
 class L5xElementBuilder:
     _cur: Cursor
     _object_id: int = -1
+    # Where fallback notes for this conversion go; pass the caller's along.
+    _notes: ConversionNotes = field(default_factory=ConversionNotes, kw_only=True)
 
 
 def _get_aoi_records(cur: Cursor, controller_id: int) -> List[Tuple[str, int, int, int]]:
@@ -2510,12 +2513,8 @@ class TagBuilder(L5xElementBuilder):
         return atomic_types.get(record.main_record.runtime_type & 0xFF, "")
 
     def _legacy_alias_for(self, value: bytes) -> str:
-        # Usually null-terminated (a trailing b"\x00\x00" utf-16 code unit),
-        # but observed on real project files without one -- a path ending in
-        # a literal ".<member/bit>" reference (e.g. an alias into a bit or an
-        # array/structure member) can occupy the field's full length with no
-        # terminator at all. The length just needs to be a whole number of
-        # utf-16 code units; a missing terminator isn't itself invalid.
+        # UTF-16 path, usually null-terminated; a path that fills the field
+        # has no terminator.
         if len(value) % 2:
             raise ValueError("Invalid alias path")
         path = value.decode("utf-16-le").rstrip("\x00")
@@ -2687,21 +2686,12 @@ class TagBuilder(L5xElementBuilder):
                     else None
                 )
             except ValueError as e:
-                # ext[0x6B] (the produced/consumed link) can be present but
-                # empty -- observed on a real project file, an empty
-                # 0-length attribute value rather than the 4-byte object_id
-                # it's supposed to hold. There's no link to recover a
-                # produce/consume descriptor from in that case, so fall back
-                # to exporting this as a plain Base tag rather than failing
-                # the whole project's export over one tag's connection info.
-                log.warning(
-                    f"Tag '{name}': couldn't build its {tag_type.lower()} "
-                    f"connection info ({e}) -- exporting it as a Base tag "
-                    "instead"
-                )
-                conversion_notes.add(
+                # An empty produce/consume link (ext 0x6B) leaves nothing to
+                # build the connection from; export a Base tag instead.
+                self._notes.warn(
                     f"Tag '{name}': {tag_type.lower()} connection info could not "
-                    "be read; exported as a Base tag"
+                    "be read; exported as a Base tag",
+                    str(e),
                 )
                 tag_type = "Base"
                 produce_info = None
@@ -3092,7 +3082,7 @@ class RoutineBuilder(L5xElementBuilder):
             # A source-protected routine keeps only its main record (and so
             # its type) readable.
             owner = _routine_owner_name(self._cur, results[0][2])
-            conversion_notes.add(
+            self._notes.add(
                 f"Routine '{owner + '/' if owner else ''}{results[0][0]}': content "
                 "could not be read (likely source-protected); exported with no rungs"
             )
@@ -3300,7 +3290,7 @@ class AoiBuilder(L5xElementBuilder):
             )
             for (child_oid,) in self._cur.fetchall():
                 try:
-                    routines.append(RoutineBuilder(self._cur, child_oid).build())
+                    routines.append(RoutineBuilder(self._cur, child_oid, _notes=self._notes).build())
                 except Exception:
                     pass
         return routines
@@ -3310,7 +3300,7 @@ class AoiBuilder(L5xElementBuilder):
         # routine names and types are stored readably. Revision, vendor,
         # dates, help text and the parameter/local-tag split are encrypted,
         # so they are left out rather than guessed.
-        conversion_notes.add(
+        self._notes.add(
             f"Add-On Instruction '{name}' is source-protected: its revision, vendor, "
             "dates, help text, parameters and local tags are encrypted and were left "
             "out; only its name, description and routine names were exported"
@@ -3513,7 +3503,7 @@ class ProgramBuilder(L5xElementBuilder):
 
         routines = []
         for child in routine_results:
-            routines.append(RoutineBuilder(self._cur, child[1]).build())
+            routines.append(RoutineBuilder(self._cur, child[1], _notes=self._notes).build())
 
         # Get the Program Scoped Tags
         tag_collection_id = _required_program_collection(
@@ -3541,7 +3531,7 @@ class ProgramBuilder(L5xElementBuilder):
         for result in results:
             if result[1] in shadowed:
                 continue
-            tag = TagBuilder(self._cur, result[1]).build()
+            tag = TagBuilder(self._cur, result[1], _notes=self._notes).build()
             if result[3] == _SYSTEM_TAG_RECORD_TYPE and tag.name == result[0]:
                 # A system-created tag (e.g. __l<hash>) under its own system
                 # name; only shadows (which carry a user name) are exported.
@@ -3624,27 +3614,12 @@ class TaskBuilder(L5xElementBuilder):
         max_program_count = (rate_offset - program_offset - 2) // 4
         scheduled_programs = []
         if prog_count > max_program_count:
-            # These are fixed offsets reverse-engineered from one reference
-            # file (CIPDemo_RevEng.ACD); observed on real, more recent
-            # project files where every field read at these offsets --
-            # rate/type/priority/watchdog included, not just the count -- is
-            # garbage (all zero, in one case), meaning the whole task record
-            # layout has shifted for that Studio/firmware version rather
-            # than just this one field being corrupt. Recovering the real
-            # offsets for that layout is unreverse-engineered work on the
-            # scale of the rest of this file, not a quick fix, so degrade
-            # gracefully: keep the task (with whatever the fixed offsets
-            # happened to read) but drop the unreadable schedule list
-            # instead of failing the entire project's export over it.
-            log.warning(
-                f"Task '{name}': scheduled-program count at the expected "
-                f"offset is implausible ({prog_count} > max {max_program_count}) "
-                "-- this task record's layout doesn't match the known format; "
-                "exporting it with an empty scheduled-program list"
-            )
-            conversion_notes.add(
+            # The record does not match a known task layout; keep the task
+            # but drop the unreadable schedule list.
+            self._notes.warn(
                 f"Task '{name}': scheduled-program list could not be read; "
-                "exported with an empty list"
+                "exported with an empty list",
+                f"scheduled-program count {prog_count} > max {max_program_count}",
             )
         else:
             for i in range(prog_count):
@@ -3809,7 +3784,7 @@ class ControllerBuilder(L5xElementBuilder):
         tags: List[Tag] = []
         for result in results:
             _tag_object_id = result[1]
-            tag = TagBuilder(self._cur, _tag_object_id).build()
+            tag = TagBuilder(self._cur, _tag_object_id, _notes=self._notes).build()
             tag._data_types_map = data_types_map
             tag._value_types_map = value_types_map
             if (
@@ -3839,7 +3814,7 @@ class ControllerBuilder(L5xElementBuilder):
         )
         programs: List[Program] = []
         comment_id_to_program: Dict[int, str] = {}
-        schedule_notes: List[str] = []
+        schedule_notes: List[Tuple[str, str]] = []
         for pname, program_oid, record_type, rec in self._cur.fetchall():
             # A program record can have a corrupt attribute length partway
             # through; export a placeholder rather than fail the project.
@@ -3848,15 +3823,11 @@ class ControllerBuilder(L5xElementBuilder):
                 comment_id_to_program[_program_schedule_id(r)] = pname
             except Exception as e:
                 r = None
-                log.warning(
-                    f"Program '{pname}': couldn't determine its task-schedule "
-                    f"ID ({type(e).__name__}: {e}) -- it won't appear in any "
-                    "task's scheduled-program list"
-                )
-                schedule_notes.append(
+                schedule_notes.append((
                     f"Program '{pname}': task-schedule ID could not be read; it "
-                    "won't appear in any task's scheduled-program list"
-                )
+                    "won't appear in any task's scheduled-program list",
+                    f"{type(e).__name__}: {e}",
+                ))
             if record_type != 256:
                 continue
             try:
@@ -3865,25 +3836,21 @@ class ControllerBuilder(L5xElementBuilder):
                 programs.append(
                     ProgramBuilder(
                         self._cur, program_oid, data_types_map, redundancy_enabled,
-                        _value_types_map=value_types_map, _record=r,
+                        _value_types_map=value_types_map, _record=r, _notes=self._notes,
                     ).build()
                 )
             except Exception as e:
-                log.warning(
-                    f"Program '{pname}' (object_id={program_oid}): "
-                    f"failed to parse its comps record ({type(e).__name__}: {e}) "
-                    "-- exporting it as an empty placeholder program"
-                )
-                conversion_notes.add(
+                self._notes.warn(
                     f"Program '{pname}': could not be read; exported as an "
-                    "empty placeholder"
+                    "empty placeholder",
+                    f"object_id={program_oid}, {type(e).__name__}: {e}",
                 )
                 programs.append(
                     Program(pname, pname, "false", None, None,
                              "false", None, "false", [], [])
                 )
-        for note in schedule_notes:
-            conversion_notes.add(note)
+        for note, detail in schedule_notes:
+            self._notes.warn(note, detail)
 
         # Get the Task Collection and build Tasks
         self._cur.execute(
@@ -3901,14 +3868,14 @@ class ControllerBuilder(L5xElementBuilder):
                 + " AND record_type=256"
             )
             for task_result in self._cur.fetchall():
-                tasks.append(TaskBuilder(self._cur, task_result[1]).build(comment_id_to_program))
+                tasks.append(TaskBuilder(self._cur, task_result[1], _notes=self._notes).build(comment_id_to_program))
 
         # Get the AOI Collection and get the AOIs
         results = _get_aoi_records(self._cur, self._object_id)
         aois: List[AOI] = []
         for result in results:
             _aoi_object_id = result[1]
-            aois.append(AoiBuilder(self._cur, _aoi_object_id).build())
+            aois.append(AoiBuilder(self._cur, _aoi_object_id, _notes=self._notes).build())
 
         # Get the Module (IO) Collection and build all Module elements.
         self._cur.execute(

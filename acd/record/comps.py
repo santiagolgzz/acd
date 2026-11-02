@@ -78,12 +78,8 @@ class CompsRecord:
         if dat_record.identifier in (64250, 65021) and CompsRecord.is_legacy(raw):
             object_id, parent_id = struct.unpack_from("<II", raw, 0x0C)
 
-            # 0xFFFFFFFF is the sentinel Rockwell uses for "no object" --
-            # observed on real project files as a deleted/tombstoned legacy
-            # record left behind in Comps.Dat with a minimal, otherwise
-            # inconsistent payload (its length fields don't describe a real
-            # object). It carries nothing worth exporting, so skip it instead
-            # of validating a payload that was never meant to be read.
+            # Object id 0xFFFFFFFF ("no object") marks a deleted record whose
+            # length fields don't describe a payload; skip it.
             if object_id == 0xFFFFFFFF:
                 return None
 

@@ -10,13 +10,13 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 from sqlite3 import Cursor
-from typing import Dict, List, Tuple, Union
+from typing import Callable, Dict, List, Tuple, Union
 
 from acd.database.dbextract import DbExtract
 from acd.zip.unzip import Unzip
 from loguru import logger as log
 
-from acd.l5x import conversion_notes
+from acd.l5x.conversion_notes import ConversionNotes
 from acd.l5x.catalog_numbers import load_external_catalog
 from acd.l5x.elements import (
     Controller,
@@ -52,8 +52,7 @@ class ExportL5x:
     _catalog_table: Union[Dict[Tuple[int, int, int], str], None] = None
 
     def __post_init__(self):
-        # Notes belong to one conversion; start each one with none.
-        conversion_notes.reset()
+        self._notes = ConversionNotes()
         if self._temp_dir is None:
             self._temp_dir = tempfile.mkdtemp(prefix="acd-build-")
             weakref.finalize(self, shutil.rmtree, self._temp_dir, True)
@@ -162,17 +161,13 @@ class ExportL5x:
         name_lookup = {oid: t[2] for oid, t in comps_by_id.items()}
         self._id_to_name: Dict[int, str] = name_lookup
 
-        # SbRegion (rungs) is read BEFORE the Region Map. populate_region_map's
-        # fallback path (see _parse_region_map) needs the set of real rung
-        # object_ids already available to empirically re-align a Region Map
-        # record whose stored length doesn't match its on-disk size -- a
-        # fixed-offset guess isn't reliable enough (see that method's
-        # docstring-length comment for what went wrong when it was).
+        # Rungs are read before the Region Map: its re-alignment fallback
+        # matches entries against the known rung object_ids.
         log.info(
             "Getting records from ACD SbRegion file and storing in sqllite database"
         )
         sb_region_db = DbExtract(os.path.join(self._temp_dir, "SbRegion.Dat")).read()
-        rung_tuples = [t for record in sb_region_db.records.record if (t := SbRegionRecord.parse(record, name_lookup)) is not None]
+        rung_tuples = [t for record in sb_region_db.records.record if (t := SbRegionRecord.parse(record, name_lookup, self._notes.add)) is not None]
         self._cur.executemany("INSERT INTO rungs VALUES (?,?,?)", rung_tuples)
         self._db.commit()
 
@@ -223,10 +218,10 @@ class ExportL5x:
             self._cur.executemany("INSERT INTO st_lines VALUES (?,?,?)", st_tuples)
             self._db.commit()
         except Exception as exc:
-            log.warning(f"Could not decode Structured Text routine bodies: {exc}")
-            conversion_notes.add(
+            self._notes.warn(
                 "Structured Text routine bodies could not be decoded; "
-                "ST routines were exported with no lines"
+                "ST routines were exported with no lines",
+                str(exc),
             )
 
         log.info("Creating indexes for fast object graph queries")
@@ -262,7 +257,7 @@ class ExportL5x:
         if self._controller is None:
             self._controller = ControllerBuilder(
                 self._cur, _catalog_table=self._catalog_table,
-                _taginfo_layouts=self._taginfo_layouts,
+                _taginfo_layouts=self._taginfo_layouts, _notes=self._notes,
             ).build()
         return self._controller
 
@@ -274,21 +269,13 @@ class ExportL5x:
             ).build()
             self._project.controller = self.controller
             # Read after the controller is built: its fallbacks are noted then.
-            self._project.conversion_notes = conversion_notes.current()
+            self._project.conversion_notes = self._notes.current()
             self._project._raw_files = self._raw_files
             self._project._file_order = self._file_order
             self._project._footer_unknown = self._footer_unknown
             self._project._id_to_name = self._id_to_name
-            # The sqlite connection (and its WAL/journal files) is only needed
-            # while the object tree above is being built. Left open, it holds
-            # an OS-level lock on acd.db inside _temp_dir for as long as this
-            # ExportL5x instance is alive -- on Windows that lock makes the
-            # caller's shutil.rmtree(temp_dir, ignore_errors=True) silently
-            # fail (ignore_errors swallows the PermissionError), so the temp
-            # directory is never actually removed. Across many files in one
-            # process (e.g. batch-converting a folder) those leaked temp dirs
-            # accumulate without bound and can fill the disk. Close it here,
-            # once the tree is fully built and nothing will query it again.
+            # Nothing queries the database after this; an open connection
+            # would lock acd.db on Windows and keep the temp dir from being removed.
             self._db.close()
         return self._project
 
@@ -319,7 +306,7 @@ class ExportL5x:
             except ValueError:
                 continue
         if parsed is None:
-            parsed = self._parse_region_map(candidates[0], known_rung_ids)
+            parsed = self._parse_region_map(candidates[0], known_rung_ids, warn=self._notes.warn)
 
         complete_entries = []
         for object_id, parent_id, unknown, seq, raw in parsed:
@@ -407,23 +394,13 @@ class ExportL5x:
             routine_label = f"'{routine}'" if routine else str(parent_id)
             if n_candidates == 0:
                 # No unclaimed rung fits this gap, so no rung is known to be missing.
-                log.warning(
-                    f"Could not recover truncated Region Map entry for routine {parent_id}, "
-                    f"seq {seq} -- it could not be matched to any unclaimed rung, so no "
-                    "rung is known to be missing"
-                )
-                conversion_notes.add(
+                self._notes.warn(
                     f"Routine {routine_label}: a truncated Region Map entry (seq {seq}) "
                     "could not be matched to any unclaimed rung, so no rung is known "
                     "to be missing"
                 )
             else:
-                log.warning(
-                    f"Could not recover truncated Region Map entry for routine {parent_id}, "
-                    f"seq {seq} ({n_candidates} ambiguous candidates) -- that rung will be "
-                    "missing from the export"
-                )
-                conversion_notes.add(
+                self._notes.warn(
                     f"Routine {routine_label}: a truncated Region Map entry (seq {seq}) "
                     f"could be any of {n_candidates} rungs -- that rung will be missing "
                     "from the export"
@@ -431,32 +408,13 @@ class ExportL5x:
 
     @staticmethod
     def _find_region_map_alignment(record, known_rung_ids):
-        """Empirically find where 16-byte Region Map entries actually start.
+        """Find where the 16-byte Region Map entries start when no length
+        field matches the record's size.
 
-        Used only as a last resort (see the caller) when neither the modern
-        nor the legacy self-described length matches the record's real size,
-        so the identifier_offset can't be read off a length field. A first
-        attempt at this fallback just assumed entries still start at the
-        modern format's fixed 0x4E offset -- wrong on a real project file:
-        that file's true entries started at byte 119 (confirmed by scanning
-        for known object_ids), which isn't even 16-byte-congruent with 0x4E
-        (119 - 0x4E = 41, not a multiple of 16). Trusting that wrong offset
-        silently produced garbage (parent_id, object_id) pairs that mostly
-        didn't match anything real, so entire routines' rungs were dropped
-        with nothing louder than the generic length-mismatch warning.
-
-        Instead, brute-force every candidate byte offset in the record,
-        interpret it as a 16-byte-strided array of (parent_id, unknown, seq,
-        object_id) entries, and score it by how many of its object_id fields
-        are real rung object_ids (`known_rung_ids`, the already-populated
-        `rungs` table -- see the caller in populate_region_map). The correct
-        offset stands out sharply: on the file that motivated this, the
-        right offset matched 813/827 entries (98%) while every other offset
-        matched 0.
-
-        Returns the best offset, or None if nothing scored well enough to
-        trust (caller then falls back to the old fixed-offset guess rather
-        than fabricating an offset with no support).
+        Tries every byte offset as the start of (parent_id, unknown, seq,
+        object_id) entries and scores it by how many object_ids are known
+        rungs. Returns the best offset, or None if none scores well enough
+        to trust.
         """
         if not known_rung_ids:
             return None
@@ -487,9 +445,12 @@ class ExportL5x:
         return None
 
     @staticmethod
-    def _parse_region_map(record, known_rung_ids=None, strict=False):
+    def _parse_region_map(
+        record, known_rung_ids=None, strict=False, warn: Callable[[str], None] = log.warning
+    ):
         # strict: raise on a stored length that doesn't match the record
         # instead of re-aligning (used to pick between Region Map copies).
+        # warn: receives a note when the entries had to be re-aligned.
         # Current empty projects use a header-only Region Map without a length
         # field or entries.
         if len(record) == 0x4A:
@@ -522,40 +483,19 @@ class ExportL5x:
                 entries_length = len(record) - identifier_offset
                 allowed_trailer_lengths = (0,)
             elif len(record) >= 78 and not strict:
-                # Neither the modern nor the legacy self-described length
-                # field matches the record's actual on-disk size -- observed
-                # on real project files where the stored 0x4A length is
-                # stale (entries were appended without the header's own
-                # length prefix being rewritten to match). Try to find where
-                # entries really start by empirical alignment against known
-                # rung object_ids (see _find_region_map_alignment); only
-                # fall back to the historical fixed-0x4E guess if that
-                # search finds nothing trustworthy, since a wrong guess here
-                # silently drops real logic rather than erroring.
+                # No length field matches the record's size: re-align against
+                # known rungs, falling back to the usual 0x4E offset.
                 found_offset = ExportL5x._find_region_map_alignment(record, known_rung_ids)
                 if found_offset is not None:
                     identifier_offset = found_offset
-                    log.warning(
-                        "Region Map record's stored length (0x4A) doesn't match "
-                        f"its on-disk size ({len(record)} bytes) -- found real "
-                        f"entries starting at offset {found_offset} (not the "
-                        "usual 0x4E) by matching against known rung object_ids"
-                    )
-                    conversion_notes.add(
+                    warn(
                         "Region Map: its stored length doesn't match its size "
                         f"({len(record)} bytes); entries were re-aligned to offset "
                         f"{found_offset} by matching known rungs"
                     )
                 else:
                     identifier_offset = 0x4E
-                    log.warning(
-                        "Region Map record's stored length (0x4A) doesn't match "
-                        f"its on-disk size ({len(record)} bytes), and no better "
-                        "alignment could be confirmed against known rung "
-                        "object_ids -- falling back to the modern 0x4E offset, "
-                        "which may not be correct for this record"
-                    )
-                    conversion_notes.add(
+                    warn(
                         "Region Map: its stored length doesn't match its size "
                         f"({len(record)} bytes) and entries could not be matched to "
                         "known rungs; assumed the usual offset 0x4E, which may be wrong"
@@ -678,11 +618,7 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
-    # Build the in-memory project and write the L5X XML. (Previously this
-    # passed the output path as ExportL5x's SECOND POSITIONAL arg, which landed
-    # in the _temp_dir field and wrote nothing -- the CLI built the SQLite DB but
-    # never emitted the .L5X. This mirrors ConvertAcdToL5x.extract() in
-    # acd.api: import the project, serialise via to_xml(), write the file.)
+    # Build the project and write the L5X, as ConvertAcdToL5x.extract() does.
     export = ExportL5x(args.input[0])
     # Thread external catalog through so out-of-table CPUs resolve to real
     # part numbers (A3 fix). None -> built-in only.

@@ -1,11 +1,12 @@
-import sqlite3
 import struct
 
 import pytest
 
-from acd.l5x import conversion_notes
+from acd.l5x.conversion_notes import ConversionNotes
 from acd.l5x.elements import RoutineBuilder, TagBuilder, TaskBuilder, _program_schedule_id
 from acd.record.rx import LegacyRxGeneric, RxGeneric
+
+from .rx_fixtures import comps_database, insert_comp, protected_rx_record, rx_record
 
 
 def _metadata(name, runtime_type=0xC4, dimensions=(0, 0, 0), schedule_id=None):
@@ -43,28 +44,6 @@ def _legacy_rx(
         raw.extend(value)
     struct.pack_into("<I", raw, 24, len(raw) - 28)
     return bytes(raw)
-
-
-def _database():
-    database = sqlite3.connect(":memory:")
-    cursor = database.cursor()
-    cursor.execute(
-        "CREATE TABLE comps(object_id int, parent_id int, comp_name text, "
-        "seq_number int, record_type int, record BLOB NOT NULL)"
-    )
-    cursor.execute(
-        "CREATE TABLE comments(seq_number int, sub_record_length int, "
-        "object_id int, record_string text, record_type int, parent int, "
-        "tag_reference text, rung_content int, member_ref int)"
-    )
-    return database, cursor
-
-
-def _insert(cursor, object_id, name, record, parent_id=0):
-    cursor.execute(
-        "INSERT INTO comps VALUES (?, ?, ?, ?, ?, ?)",
-        (object_id, parent_id, name, 0, 256, record),
-    )
 
 
 def test_parse_legacy_rx_generic():
@@ -135,16 +114,16 @@ def test_legacy_rx_accepts_short_final_attribute():
 def test_build_legacy_base_tag(
     type_name, runtime_type, dimensions, expected_dimensions
 ):
-    database, cursor = _database()
+    database, cursor = comps_database()
     try:
-        _insert(cursor, 300, type_name, b"")
-        _insert(
+        insert_comp(cursor, 300, type_name, b"")
+        insert_comp(
             cursor,
             200,
             "DataInstance",
             _legacy_rx(cip_type=0x6A, data_instance_id=300, object_id=200),
         )
-        _insert(
+        insert_comp(
             cursor,
             100,
             "LegacyTag",
@@ -171,15 +150,15 @@ def test_build_legacy_base_tag(
 
 
 def test_build_legacy_message_tag():
-    database, cursor = _database()
+    database, cursor = comps_database()
     try:
-        _insert(
+        insert_comp(
             cursor,
             200,
             "MessageData",
             _legacy_rx(cip_type=0x8D, data_instance_id=0, object_id=200),
         )
-        _insert(
+        insert_comp(
             cursor,
             100,
             "LegacyMessage",
@@ -204,9 +183,9 @@ def test_build_legacy_message_tag():
     ],
 )
 def test_build_legacy_motion_tag(target_class, runtime_type, expected_type):
-    database, cursor = _database()
+    database, cursor = comps_database()
     try:
-        _insert(
+        insert_comp(
             cursor,
             200,
             "MotionData",
@@ -214,7 +193,7 @@ def test_build_legacy_motion_tag(target_class, runtime_type, expected_type):
         )
         metadata = bytearray(_metadata("LegacyMotion", runtime_type))
         metadata[0x20F] = 0
-        _insert(
+        insert_comp(
             cursor,
             100,
             "LegacyMotion",
@@ -240,17 +219,17 @@ def test_build_legacy_motion_tag(target_class, runtime_type, expected_type):
 def test_build_legacy_produced_and_consumed_tags(
     expected_tag_type, descriptor_length
 ):
-    database, cursor = _database()
+    database, cursor = comps_database()
     try:
-        _insert(cursor, 300, "DINT", b"")
-        _insert(
+        insert_comp(cursor, 300, "DINT", b"")
+        insert_comp(
             cursor,
             200,
             "DataInstance",
             _legacy_rx(cip_type=0x6A, data_instance_id=300, object_id=200),
         )
         linked_metadata = struct.pack("<IIII", 4, 3, 0, 2)
-        _insert(
+        insert_comp(
             cursor,
             201,
             "LinkedData",
@@ -291,10 +270,10 @@ def test_build_legacy_produced_and_consumed_tags(
             descriptor[0x24 : 0x24 + len(remote_tag)] = remote_tag
             descriptor[0x143] = 2
             descriptor_attribute = 0x190
-            _insert(cursor, 400, "ProducerPLC", b"")
+            insert_comp(cursor, 400, "ProducerPLC", b"")
             tag_attributes.insert(1, (0x66, struct.pack("<I", 400)))
 
-        _insert(
+        insert_comp(
             cursor,
             500,
             "ConnectionDescriptor",
@@ -314,7 +293,7 @@ def test_build_legacy_produced_and_consumed_tags(
                 ),
             ),
         )
-        _insert(
+        insert_comp(
             cursor,
             100,
             "LegacyTag",
@@ -346,11 +325,11 @@ def test_build_legacy_produced_and_consumed_tags(
 
 
 def test_legacy_processor_minimum_rpi():
-    database, cursor = _database()
+    database, cursor = comps_database()
     try:
         metadata = bytearray(48)
         struct.pack_into("<HHH", metadata, 2, 1, 14, 72)
-        _insert(
+        insert_comp(
             cursor,
             600,
             "Local",
@@ -367,10 +346,10 @@ def test_legacy_processor_minimum_rpi():
 
 
 def test_build_legacy_alias_tag():
-    database, cursor = _database()
+    database, cursor = comps_database()
     try:
         target_id = 0x44CD5793
-        _insert(
+        insert_comp(
             cursor,
             target_id,
             "$Target$",
@@ -380,7 +359,7 @@ def test_build_legacy_alias_tag():
             ),
         )
         alias_path = f"@{target_id:08x}@.11\0".encode("utf-16-le")
-        _insert(
+        insert_comp(
             cursor,
             100,
             "LegacyAlias",
@@ -407,10 +386,10 @@ def test_build_legacy_alias_tag():
 
 
 def test_legacy_alias_rejects_missing_target():
-    database, cursor = _database()
+    database, cursor = comps_database()
     try:
         alias_path = "@44cd5793@.11\0".encode("utf-16-le")
-        _insert(
+        insert_comp(
             cursor,
             100,
             "LegacyAlias",
@@ -452,9 +431,9 @@ def test_legacy_program_schedule_id_and_task():
         attributes=[(0x01, bytes(task_data))],
     )
 
-    database, cursor = _database()
+    database, cursor = comps_database()
     try:
-        _insert(cursor, 100, "MainTask", task_record)
+        insert_comp(cursor, 100, "MainTask", task_record)
         task = TaskBuilder(cursor, 100).build({schedule_id: "MainProgram"})
 
         assert task.type == "PERIODIC"
@@ -473,9 +452,9 @@ def test_legacy_task_ignores_excess_program_count():
         cip_type=0x70,
         attributes=[(0x01, bytes(task_data))],
     )
-    database, cursor = _database()
+    database, cursor = comps_database()
     try:
-        _insert(cursor, 100, "MainTask", task_record)
+        insert_comp(cursor, 100, "MainTask", task_record)
         # An implausible count means an unknown task layout: keep the task,
         # drop the unreadable schedule list.
         task = TaskBuilder(cursor, 100).build({})
@@ -489,22 +468,21 @@ def test_protected_routine_keeps_its_type():
     # encrypted envelope in place of the attributes.
     main = bytearray(60)
     struct.pack_into("<H", main, 0x30, 1)
-    header = struct.pack("<IIHHH", 0, 0, 0, 0x6D, 0)
-    record = header + bytes(main) + struct.pack("<II", 999, 0x0AAA96AA) + bytes(16)
-    database, cursor = _database()
+    record = protected_rx_record(0x6D, main=bytes(main))
+    database, cursor = comps_database()
     try:
-        _insert(cursor, 100, "Logic", record)
-        routine = RoutineBuilder(cursor, 100).build()
+        insert_comp(cursor, 100, "Logic", record)
+        notes = ConversionNotes()
+        routine = RoutineBuilder(cursor, 100, _notes=notes).build()
         assert (routine.type, routine.rungs) == ("RLL", [])
-        assert "could not be read" in conversion_notes.current()[-1]
+        assert "could not be read" in notes.current()[-1]
     finally:
         database.close()
 
 
 def test_rx_reads_final_attribute():
     attributes = struct.pack("<II", 0x65, 4) + b"\x01\x02\x03\x04" + struct.pack("<II", 0x01, 3) + b"abc"
-    head = struct.pack("<IIHHH", 0, 0, 0, 0x68, 0) + bytes(60)
-    raw = head + struct.pack("<II", len(attributes) + 8, 2) + attributes
+    raw = rx_record(0x68, 0, attributes, 2, length_extra=8)
     parsed = RxGeneric.from_bytes(raw)
     assert [(item.attribute_id, bytes(item.value)) for item in parsed.extended_records] == [
         (0x65, b"\x01\x02\x03\x04"),

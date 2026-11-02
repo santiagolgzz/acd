@@ -228,7 +228,7 @@ def test_type1_internal_string_records_are_skipped():
 
 def test_notes_added_before_project_is_read_appear_in_comment():
     export = ExportL5x(AOI_ACD)
-    conversion_notes.add("Made up note: tag 'Fake' used a stand-in value")
+    export._notes.add("Made up note: tag 'Fake' used a stand-in value")
     xml_out = export.project.to_xml()
     assert xml_out.startswith(
         "<!-- acd-tools conversion notes:\n"
@@ -237,8 +237,8 @@ def test_notes_added_before_project_is_read_appear_in_comment():
     assert _controller(xml_out) is not None
 
 
-def test_stale_notes_are_cleared_by_a_new_export():
-    conversion_notes.add("Made up stale note")
+def test_notes_do_not_carry_over_to_another_export():
+    ExportL5x(AOI_ACD)._notes.add("Made up stale note")
     xml_out = ExportL5x(AOI_ACD).project.to_xml()
     assert "Made up stale note" not in xml_out
 
@@ -382,7 +382,7 @@ def test_rung_text_with_invalid_utf16_is_kept(monkeypatch):
         record_buffer="NOP();".encode("utf-16-le") + b"\x00\xd8",  # lone surrogate
     )
     monkeypatch.setattr(sbregion.FafaSbregions, "from_bytes", lambda _: fake)
-    conversion_notes.reset()
-    entry = sbregion.SbRegionRecord.parse(_dat(b""), {})
+    notes = []
+    entry = sbregion.SbRegionRecord.parse(_dat(b""), {}, notes.append)
     assert entry[1].startswith("NOP();")
-    assert "not valid UTF-16" in conversion_notes.current()[0]
+    assert "not valid UTF-16" in notes[0]
