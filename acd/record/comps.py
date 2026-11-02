@@ -2,7 +2,7 @@ import struct
 from dataclasses import dataclass
 from io import BytesIO
 from sqlite3 import Cursor
-from typing import Optional
+from typing import Optional, Tuple
 
 from acd.database.dbextract import DatRecord
 from kaitaistruct import KaitaiStream
@@ -10,6 +10,14 @@ from kaitaistruct import KaitaiStream
 from acd.generated.comps.fafa_comps import FafaComps
 from acd.generated.comps.fdfd_comps import FdfdComps
 
+
+def comment_keys(buf: bytes, offset: int) -> Tuple[int, int]:
+    """(scope key, member key) from the (cip_type, comment_id) pairs of the
+    owning scope and of the object itself at `offset`; the member key is 0
+    when the object has no scope of its own."""
+    scope_cip, scope_cid, own_cip, own_cid = struct.unpack_from("<HHHH", buf, offset)
+    member_key = (own_cid * 0x10000) + own_cip if own_cip else 0
+    return (scope_cid * 0x10000) + scope_cip, member_key
 
 @dataclass
 class RecordData:
@@ -31,6 +39,32 @@ class CompsRecord:
             return
         self._cur.execute(f"DELETE FROM comps WHERE object_id={entry[0]}")
         self._cur.execute("INSERT INTO comps VALUES (?, ?, ?, ?, ?, ?)", entry)
+
+    @staticmethod
+    def legacy_comment_keys(dat_record: DatRecord) -> Optional[Tuple[int, int]]:
+        """(scope key, member key) of a legacy (v20 and earlier) FAFA record.
+
+        The legacy record keeps the same Rx header fields as the current
+        layout's 0x08-0x12 at raw 0x66-0x70, inside the area parse() skips:
+        u16 format, then (cip_type, comment_id) of the owning scope and of the
+        object itself. Comments are filed under parent = scope key and
+        member_ref = own key; objects without a scope (controller tags) carry
+        their own key first and member key 0.
+        """
+        if dat_record.identifier != 64250:
+            return None
+        raw = bytes(dat_record.record.record_buffer)
+        if len(raw) < 0x70 or not CompsRecord.is_legacy(raw):
+            return None
+        if not struct.unpack_from("<H", raw, 0x68)[0]:
+            return None
+        return comment_keys(raw, 0x68)
+
+    @staticmethod
+    def is_legacy(raw: bytes) -> bool:
+        """True for a record of the v20-and-earlier layout, whose object id
+        fills the four bytes at 0x0C that newer files leave zero."""
+        return len(raw) >= 0x10 and struct.unpack_from("<I", raw, 0x0C)[0] != 0
 
     @staticmethod
     def parse(dat_record: DatRecord) -> Optional[tuple]:

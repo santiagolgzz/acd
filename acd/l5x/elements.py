@@ -2511,12 +2511,14 @@ class TagBuilder(L5xElementBuilder):
             )
         self._record = r
 
-        scope_key, member_key = (
-            (0, 0) if isinstance(r, LegacyRxGeneric) else scoped_comment_keys(raw_rec)
-        )
-        if member_key:
-            # Program tag: only the comments filed under this tag's own key,
-            # not every comment in the program's scope.
+        if isinstance(r, LegacyRxGeneric):
+            scope_key, member_key = _legacy_comment_keys(self._cur, self._object_id)
+        else:
+            scope_key, member_key = scoped_comment_keys(raw_rec)
+        if member_key or isinstance(r, LegacyRxGeneric):
+            # Program tags: (program, tag); legacy controller tags: (tag, 0).
+            # Only the comments filed under this tag's own key, not every
+            # comment in the program's scope.
             self._cur.execute(
                 f"SELECT tag_reference, record_string FROM comments WHERE parent=? AND member_ref=? AND {_USER_COMMENT}",
                 (scope_key, member_key),
@@ -2951,6 +2953,19 @@ def scoped_comment_keys(raw: bytes) -> Tuple[int, int]:
     return (scope_cid * 0x10000) + scope_cip, member_key
 
 
+def _legacy_comment_keys(cur: Cursor, object_id: int) -> Tuple[int, int]:
+    """(scope key, member key) of a legacy-layout object, from the comment_keys
+    table ExportL5x fills from the record header; (0, 0) if unknown."""
+    try:
+        cur.execute(
+            "SELECT scope_key, member_key FROM comment_keys WHERE object_id=?", (object_id,)
+        )
+        row = cur.fetchone()
+    except Exception:
+        row = None
+    return (row[0], row[1]) if row else (0, 0)
+
+
 @dataclass
 class RoutineBuilder(L5xElementBuilder):
     def build(self) -> Routine:
@@ -3013,7 +3028,8 @@ class RoutineBuilder(L5xElementBuilder):
         # have rung_content=0).
         rung_comments: Dict[int, str] = {}
         scope_key, member_key = (
-            (0, 0) if isinstance(r, LegacyRxGeneric) else scoped_comment_keys(record)
+            _legacy_comment_keys(self._cur, self._object_id)
+            if isinstance(r, LegacyRxGeneric) else scoped_comment_keys(record)
         )
         try:
             index_by_uid: Dict[int, int] = {}
