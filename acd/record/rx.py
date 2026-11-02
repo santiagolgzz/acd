@@ -1,6 +1,6 @@
 import struct
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 from acd.generated.comps.rx_generic import RxGeneric as GeneratedRxGeneric
 
@@ -137,6 +137,10 @@ class CurrentRxGeneric(GeneratedRxGeneric, _RxAttributes):
         return struct.unpack_from("<H", self.record_buffer, 0x30)[0]
 
 
+# A parsed Rx record of either layout.
+RxRecord = Union[LegacyRxGeneric, CurrentRxGeneric]
+
+
 class RxGeneric:
     @staticmethod
     def _current(raw: bytes) -> CurrentRxGeneric:
@@ -151,11 +155,19 @@ class RxGeneric:
             return parsed
 
     @staticmethod
-    def from_bytes(raw: bytes):
+    def from_bytes(raw: bytes, allow_protected: bool = False):
+        """Parse an Rx record of either layout.
+
+        A source-protected record raises ValueError unless `allow_protected`
+        is set; then it parses to its header and main record only, with
+        `protected` set.
+        """
         raw = bytes(raw)
         if len(raw) >= 82:
             stored_length, count = struct.unpack_from("<II", raw, 74)
             if count == ENCRYPTED_ENVELOPE_MAGIC:
+                if not allow_protected:
+                    raise ValueError("Rx record is source-protected (encrypted)")
                 # Read the header and main record only (as a record with no
                 # attributes); the attributes are encrypted.
                 parsed = CurrentRxGeneric.from_bytes(raw[:78] + bytes(4))

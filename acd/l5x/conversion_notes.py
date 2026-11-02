@@ -12,7 +12,7 @@ from typing import List
 from loguru import logger as log
 
 # Characters that are illegal in XML 1.0. acd.l5x.elements imports this pattern.
-_XML_ILLEGAL_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f￾￿]")
+XML_ILLEGAL_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f￾￿]")
 # XML forbids "--" inside a comment.
 _DOUBLE_HYPHEN_RE = re.compile("-{2,}")
 
@@ -47,6 +47,6 @@ def xml_comment(notes: List[str]) -> str:
         return ""
     lines = []
     for note in notes:
-        text = _XML_ILLEGAL_RE.sub("", " ".join(note.splitlines()))
+        text = XML_ILLEGAL_RE.sub("", " ".join(note.splitlines()))
         lines.append(_DOUBLE_HYPHEN_RE.sub("-", text))
     return "<!-- acd-tools conversion notes:\n" + "\n".join(lines) + "\n-->\n"

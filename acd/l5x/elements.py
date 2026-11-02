@@ -14,12 +14,11 @@ from typing import Any, List, NamedTuple, Tuple, Dict, Union
 
 from loguru import logger as log
 
-from acd.l5x import conversion_notes
-from acd.l5x.conversion_notes import ConversionNotes, _XML_ILLEGAL_RE
+from acd.l5x.conversion_notes import XML_ILLEGAL_RE, ConversionNotes, xml_comment
 from acd.l5x.catalog_numbers import CATALOG_NUMBERS, catalog_number_for_identity
 from acd.l5x.port_structures import PORT_STRUCTURES
 from acd.record.comps import comment_keys
-from acd.record.rx import LegacyRxGeneric, RxGeneric
+from acd.record.rx import LegacyRxGeneric, RxGeneric, RxRecord
 
 
 def _escape_xml_attr(value: object) -> str:
@@ -33,7 +32,7 @@ def _escape_xml_attr(value: object) -> str:
     attribute value, producing non-well-formed L5X that breaks downstream XML
     parsers.
     """
-    text = _XML_ILLEGAL_RE.sub("", str(value))
+    text = XML_ILLEGAL_RE.sub("", str(value))
     text = html.escape(text, quote=True)
     return text.replace("\t", "&#x9;").replace("\r", "&#xD;").replace("\n", "&#xA;")
 
@@ -44,7 +43,7 @@ def _cdata_section(text: str) -> str:
     A CDATA section cannot contain ``]]>``, so that sequence is split across
     two sections (``]]]]><![CDATA[>``), which is how Rockwell escapes it.
     """
-    text = _XML_ILLEGAL_RE.sub("", text).replace("]]>", "]]]]><![CDATA[>")
+    text = XML_ILLEGAL_RE.sub("", text).replace("]]>", "]]]]><![CDATA[>")
     return f"<![CDATA[{text}]]>"
 
 
@@ -86,6 +85,23 @@ class L5xElementBuilder:
     _object_id: int = -1
     # Where fallback notes for this conversion go; pass the caller's along.
     _notes: ConversionNotes = field(default_factory=ConversionNotes, kw_only=True)
+
+
+# Comment rows that hold user text. A type-1 row's object_id says what it
+# holds: 1 is a user comment; other values are internal strings (member
+# names, localization metadata) laid out differently, which would otherwise
+# be read as a truncated description. Only the older rung-comment layout,
+# which numbers rungs in object_id, reads type-1 rows without this filter.
+_USER_COMMENT = "(record_type != 1 OR object_id = 1)"
+
+
+def _get_program_records(cur: Cursor, collection_id: int) -> List[Tuple[str, int, int, bytes]]:
+    cur.execute(
+        "SELECT comp_name, object_id, record_type, record FROM comps "
+        "WHERE parent_id=? AND record_type=256",
+        (collection_id,),
+    )
+    return cur.fetchall()
 
 
 def _get_aoi_records(cur: Cursor, controller_id: int) -> List[Tuple[str, int, int, int]]:
@@ -333,15 +349,20 @@ _BUILTIN_STRUCT_MEMBERS: Dict[str, List[Tuple[str, str]]] = {
     ],
 }
 
-# Control-word bit names (BOOL members, from bit 31 down) and DINT member names
-# (in order) of each built-in struct, derived from _BUILTIN_STRUCT_MEMBERS.
+# Stored layout of the built-in structs above: a control word, then two DINTs.
+# These tables, not the display list, set the 12-byte element size and the
+# value decoding, so they are declared on their own.
+# Control-word bit names, from bit 31 down.
 _BUILTIN_STRUCT_BITS: Dict[str, List[str]] = {
-    name: [m for m, t in members if t == "BOOL"]
-    for name, members in _BUILTIN_STRUCT_MEMBERS.items()
+    "TIMER": ["EN", "TT", "DN"],
+    "COUNTER": ["CU", "CD", "DN", "OV", "UN"],
+    "CONTROL": ["EN", "EU", "DN", "EM", "ER", "UL", "IN", "FD"],
 }
+# The two DINTs after the control word, in stored order.
 _BUILTIN_STRUCT_WORDS: Dict[str, List[str]] = {
-    name: [m for m, t in members if t == "DINT"]
-    for name, members in _BUILTIN_STRUCT_MEMBERS.items()
+    "TIMER": ["PRE", "ACC"],
+    "COUNTER": ["PRE", "ACC"],
+    "CONTROL": ["LEN", "POS"],
 }
 
 # Types for which we emit no Decorated element at all (they use other formats).
@@ -1622,7 +1643,7 @@ class RSLogix5000Content(L5xElement):
     def to_xml(self) -> str:
         # The comment comes before the root element, so it lands right after
         # the XML declaration that the caller writes first.
-        return conversion_notes.xml_comment(self.conversion_notes) + super().to_xml()
+        return xml_comment(self.conversion_notes) + super().to_xml()
 
 
 def radix_enum(i: int) -> str:
@@ -1778,7 +1799,7 @@ class MemberBuilder(L5xElementBuilder):
             member_ref = struct.unpack_from("<I", raw_comps, 14)[0]
             if member_ref:
                 self._cur.execute(
-                    "SELECT record_string FROM comments WHERE parent=? AND member_ref=? LIMIT 1",
+                    f"SELECT record_string FROM comments WHERE parent=? AND member_ref=? AND {_USER_COMMENT} LIMIT 1",
                     ((r.comment_id * 0x10000) + r.cip_type, member_ref),
                 )
                 desc_row = self._cur.fetchone()
@@ -1895,7 +1916,7 @@ class DataTypeBuilder(L5xElementBuilder):
         # --- Description ---
         description: Union[str, None] = None
         self._cur.execute(
-            "SELECT record_string FROM comments WHERE parent=? AND member_ref=0 LIMIT 1",
+            f"SELECT record_string FROM comments WHERE parent=? AND member_ref=0 AND {_USER_COMMENT} LIMIT 1",
             ((r.comment_id * 0x10000) + r.cip_type,),
         )
         desc_row = self._cur.fetchone()
@@ -1944,7 +1965,14 @@ class DataTypeBuilder(L5xElementBuilder):
     def _legacy_description(self) -> Union[str, None]:
         """A legacy-layout type's description, filed under its own comment key."""
         scope_key, _ = _legacy_comment_keys(self._cur, self._object_id)
-        return _own_description(self._cur, scope_key, None, 0)
+        if not scope_key:
+            return None
+        self._cur.execute(
+            f"SELECT record_string FROM comments WHERE parent=? AND member_ref=0 AND {_USER_COMMENT} LIMIT 1",
+            (scope_key,),
+        )
+        row = self._cur.fetchone()
+        return row[0] if row and row[0] else None
 
 
 @dataclass
@@ -2183,7 +2211,7 @@ class ModuleBuilder(L5xElementBuilder):
         # (comment_id * 0x10000 + cip_type), same as for tags.
         description = ""
         self._cur.execute(
-            "SELECT record_string FROM comments WHERE parent=? AND member_ref=0 LIMIT 1",
+            f"SELECT record_string FROM comments WHERE parent=? AND member_ref=0 AND {_USER_COMMENT} LIMIT 1",
             ((r.comment_id * 0x10000) + r.cip_type,),
         )
         desc_row = self._cur.fetchone()
@@ -2254,6 +2282,10 @@ class ModuleBuilder(L5xElementBuilder):
 
 @dataclass
 class TagBuilder(L5xElementBuilder):
+    # The parsed tag record, set by _build() for build(); None when the
+    # record isn't a tag.
+    _record: Any = field(default=None)
+
     def _taginfo_data_type(self, name: str) -> str:
         # Fallback for tags whose records don't resolve a type (e.g. alarm
         # tags in legacy files): TagInfo.XML lists every tag with its type.
@@ -2465,7 +2497,7 @@ class TagBuilder(L5xElementBuilder):
         }
         return atomic_types.get(record.main_record.runtime_type & 0xFF, "")
 
-    def _legacy_alias_for(self, value: bytes) -> str:
+    def _resolve_alias_path(self, value: bytes) -> str:
         # UTF-16 path, usually null-terminated; a path that fills the field
         # has no terminator.
         if len(value) % 2:
@@ -2551,7 +2583,6 @@ class TagBuilder(L5xElementBuilder):
             external_access = "Read/Write"
             constant = None
 
-        # The parsed tag record, kept for build(); None when it isn't a tag.
         self._record = None
         try:
             r = RxGeneric.from_bytes(raw_rec)
@@ -2567,18 +2598,20 @@ class TagBuilder(L5xElementBuilder):
         self._record = r
 
         # Program tags: (program, tag); controller tags: (tag, 0).
-        scope_key, member_key = _comment_keys(self._cur, self._object_id, r, raw_rec)
+        scope_key, member_key = _comment_keys(self._cur, self._object_id, r)
         if member_key or isinstance(r, LegacyRxGeneric):
             # Only the comments filed under this tag's own key, not every
             # comment in the program's scope.
             self._cur.execute(
-                "SELECT tag_reference, record_string FROM comments WHERE parent=? AND member_ref=?",
+                "SELECT tag_reference, record_string FROM comments WHERE parent=? AND member_ref=? "
+                f"AND {_USER_COMMENT} ORDER BY rowid",
                 (scope_key, member_key),
             )
         else:
             self._cur.execute(
                 "SELECT tag_reference, record_string FROM comments WHERE parent="
                 + str((r.comment_id * 0x10000) + r.cip_type)
+                + f" AND {_USER_COMMENT} ORDER BY rowid"
             )
         comment_results = self._cur.fetchall()
 
@@ -2606,7 +2639,7 @@ class TagBuilder(L5xElementBuilder):
                     None,
                     r.main_record.data_table_instance,
                     comment_results,
-                    alias_for=self._legacy_alias_for(extended_records[0x65]),
+                    alias_for=self._resolve_alias_path(extended_records[0x65]),
                 )
 
             data_type = self._legacy_data_type(r)
@@ -2684,7 +2717,7 @@ class TagBuilder(L5xElementBuilder):
             # Current-layout alias tags keep the same @<object id>@ path as
             # legacy ones, in attribute 0x65.
             try:
-                alias_for = self._legacy_alias_for(extended_records[0x65])
+                alias_for = self._resolve_alias_path(extended_records[0x65])
             except ValueError as e:
                 log.warning(
                     f"Tag '{name}': couldn't resolve its alias target ({e}) -- "
@@ -2728,7 +2761,7 @@ class TagBuilder(L5xElementBuilder):
         )
 
 
-def _program_tag_usage(r) -> Union[str, None]:
+def _program_tag_usage(r: RxRecord) -> Union[str, None]:
     """Usage of a program parameter tag, or None for other tags.
 
     Current-layout program tags (cip_type 0x68) keep usage flags at ext[0x01]
@@ -2846,7 +2879,7 @@ class ParameterBuilder(L5xElementBuilder):
             member_ref = struct.unpack_from("<I", raw_rec, 14)[0]
             if member_ref:
                 self._cur.execute(
-                    "SELECT record_string FROM comments WHERE parent=? AND member_ref=? LIMIT 1",
+                    f"SELECT record_string FROM comments WHERE parent=? AND member_ref=? AND {_USER_COMMENT} LIMIT 1",
                     ((r.comment_id * 0x10000) + r.cip_type, member_ref),
                 )
                 desc_row = self._cur.fetchone()
@@ -2917,7 +2950,7 @@ class LocalTagBuilder(L5xElementBuilder):
             member_ref = struct.unpack_from("<I", raw_rec, 14)[0]
             if member_ref:
                 self._cur.execute(
-                    "SELECT record_string FROM comments WHERE parent=? AND member_ref=? LIMIT 1",
+                    f"SELECT record_string FROM comments WHERE parent=? AND member_ref=? AND {_USER_COMMENT} LIMIT 1",
                     ((r.comment_id * 0x10000) + r.cip_type, member_ref),
                 )
                 desc_row = self._cur.fetchone()
@@ -2962,7 +2995,7 @@ def _own_description(cur: Cursor, parent: int, alt_parent: Union[int, None],
             "SELECT record_string FROM comments WHERE parent IN ("
             + ",".join("?" * len(parents))
             + ") AND member_ref=? AND rung_content=0 AND tag_reference='' "
-            "AND record_string!='' ORDER BY rowid",
+            f"AND record_string!='' AND {_USER_COMMENT} ORDER BY rowid",
             (*parents, member_ref),
         )
         row = cur.fetchone()
@@ -2999,11 +3032,13 @@ def _legacy_comment_keys(cur: Cursor, object_id: int) -> Tuple[int, int]:
     return (row[0], row[1]) if row else (0, 0)
 
 
-def _comment_keys(cur: Cursor, object_id: int, r, raw: bytes) -> Tuple[int, int]:
+def _comment_keys(cur: Cursor, object_id: int, r: RxRecord) -> Tuple[int, int]:
     """(scope key, member key) of a parsed Rx record of either layout."""
     if isinstance(r, LegacyRxGeneric):
         return _legacy_comment_keys(cur, object_id)
-    return scoped_comment_keys(raw)
+    # The header's cip_type and comment_id are the scope's pair; the
+    # object's own pair opens the main record (see scoped_comment_keys).
+    return comment_keys(struct.pack("<HH", r.cip_type, r.comment_id) + bytes(r.record_buffer[:4]), 0)
 
 
 def _routine_owner_name(cur: Cursor, collection_id: int) -> str:
@@ -3028,21 +3063,27 @@ class RoutineBuilder(L5xElementBuilder):
         results = self._cur.fetchall()
 
         try:
-            r = RxGeneric.from_bytes(results[0][3])
+            r = RxGeneric.from_bytes(results[0][3], allow_protected=True)
         except Exception:
             r = None
         if r is None or r.protected:
-            # A source-protected routine keeps only its main record (and so
-            # its type) readable.
+            # A source-protected routine's attributes are encrypted, but its
+            # 60-byte main record is intact, so the routine type can still be
+            # read from it (0x30 of the main record, which starts at 14). An
+            # unreadable record gets the same fallback.
+            raw = bytes(results[0][3])
+            routine_type = (
+                routine_type_enum(struct.unpack_from("<H", raw, 14 + 0x30)[0])
+                if len(raw) >= 74
+                else ""
+            )
             owner = _routine_owner_name(self._cur, results[0][2])
             self._notes.add(
                 f"Routine '{owner + '/' if owner else ''}{results[0][0]}': content "
                 "could not be read (likely source-protected); exported with no rungs"
             )
-            routine_type = routine_type_enum(r.routine_type) if r is not None else ""
             return Routine(results[0][0], results[0][0], routine_type, [])
 
-        record = results[0][3]
         name = results[0][0]
         routine_type = routine_type_enum(r.routine_type)
 
@@ -3082,7 +3123,7 @@ class RoutineBuilder(L5xElementBuilder):
         # comments from internal metadata strings like FBDRoutineDescription which
         # have rung_content=0).
         rung_comments: Dict[int, str] = {}
-        scope_key, member_key = _comment_keys(self._cur, self._object_id, r, record)
+        scope_key, member_key = _comment_keys(self._cur, self._object_id, r)
         try:
             if member_key:
                 # Rung comments sit in the program's comment scope with
@@ -3098,12 +3139,26 @@ class RoutineBuilder(L5xElementBuilder):
                 }
                 self._cur.execute(
                     "SELECT rung_content, record_string FROM comments "
-                    "WHERE parent=? AND member_ref=? AND record_type=1 AND rung_content!=0",
+                    "WHERE parent=? AND member_ref=? AND record_type=1 AND rung_content!=0 "
+                    f"AND {_USER_COMMENT} ORDER BY rowid",
                     (scope_key, member_key),
                 )
                 for rung_content, rec_str in self._cur.fetchall():
                     rung_index = index_by_uid.get(rung_content >> 16)
                     if rung_index is not None and rec_str and rung_index not in rung_comments:
+                        rung_comments[rung_index] = rec_str
+            else:
+                # Older layout: comments under the routine's own key, with
+                # object_id as the 1-based rung index (rung 0 -> object_id=1).
+                # These are the only rows read without the user-comment filter.
+                self._cur.execute(
+                    "SELECT object_id, record_string FROM comments "
+                    "WHERE parent=? AND record_type=1 AND rung_content!=0 ORDER BY rowid",
+                    ((r.comment_id * 0x10000) + r.cip_type,),
+                )
+                for obj_id, rec_str in self._cur.fetchall():
+                    rung_index = obj_id - 1  # convert 1-based to 0-based
+                    if rung_index >= 0 and rec_str and rung_index not in rung_comments:
                         rung_comments[rung_index] = rec_str
         except Exception:
             pass
@@ -3225,7 +3280,13 @@ def _aoi_data_type_description(cur, name: str) -> Union[str, None]:
         r = RxGeneric.from_bytes(bytes(row[0]))
     except Exception:
         return None
-    return _own_description(cur, (r.comment_id * 0x10000) + r.cip_type, None, 0)
+    cur.execute(
+        "SELECT record_string FROM comments WHERE parent=? AND member_ref=0 "
+        f"AND record_type=1 AND tag_reference='' AND {_USER_COMMENT} LIMIT 1",
+        ((r.comment_id * 0x10000) + r.cip_type,),
+    )
+    desc_row = cur.fetchone()
+    return desc_row[0] if desc_row and desc_row[0] else None
 
 
 @dataclass
@@ -3277,7 +3338,7 @@ class AoiBuilder(L5xElementBuilder):
         aoi_record = bytes(results[0][3])
         name = results[0][0]
         try:
-            _r_aoi = RxGeneric.from_bytes(aoi_record)
+            _r_aoi = RxGeneric.from_bytes(aoi_record, allow_protected=True)
         except Exception:
             _r_aoi = None
         if _r_aoi is not None and _r_aoi.protected:
@@ -3356,7 +3417,7 @@ class AoiBuilder(L5xElementBuilder):
         if _r_aoi is not None:
             aoi_comment_parent = (_r_aoi.comment_id * 0x10000) + _r_aoi.cip_type
             self._cur.execute(
-                "SELECT record_string FROM comments WHERE parent=? AND member_ref=0 LIMIT 1",
+                f"SELECT record_string FROM comments WHERE parent=? AND member_ref=0 AND {_USER_COMMENT} LIMIT 1",
                 (aoi_comment_parent,),
             )
             desc_row = self._cur.fetchone()
@@ -3364,7 +3425,8 @@ class AoiBuilder(L5xElementBuilder):
                 aoi_description = desc_row[0]
             try:
                 self._cur.execute(
-                    "SELECT record_string FROM comments WHERE parent=? AND tag_reference='__REVISION_NOTE__' LIMIT 1",
+                    "SELECT record_string FROM comments WHERE parent=? AND tag_reference='__REVISION_NOTE__' "
+                    "ORDER BY rowid LIMIT 1",
                     (aoi_comment_parent,),
                 )
                 rn_row = self._cur.fetchone()
@@ -3496,6 +3558,7 @@ class ProgramBuilder(L5xElementBuilder):
         self._cur.execute(
             "SELECT tag_reference, record_string FROM comments WHERE parent="
             + str((r.comment_id * 0x10000) + r.cip_type)
+            + f" AND {_USER_COMMENT} ORDER BY rowid"
         )
         comment_results = self._cur.fetchall()
 
@@ -3511,7 +3574,7 @@ class ProgramBuilder(L5xElementBuilder):
 _TASK_TYPE_MAP = {1: "EVENT", 2: "PERIODIC", 4: "CONTINUOUS"}
 
 
-def _program_schedule_id(parsed) -> int:
+def _program_schedule_id(parsed: RxRecord) -> int:
     """A program's task-schedule id: attribute 0x01 offset 267 in legacy
     records, the Rx comment id in current ones."""
     if isinstance(parsed, LegacyRxGeneric):
@@ -3533,16 +3596,37 @@ class TaskBuilder(L5xElementBuilder):
 
         # All task config fields live within ext[0x01]; offsets below are
         # relative to that attribute's value (reverse-engineered from
-        # CIPDemo_RevEng.ACD). The current layout's attribute is larger than
-        # 0x10D4 bytes; the legacy layout's is at least 806.
-        task_data = RxGeneric.from_bytes(record).attribute(0x01) or b""
-        if len(task_data) > 0x10D4:
+        # CIPDemo_RevEng.ACD, where it starts at record offset 0x5A). The
+        # current layout's attribute is larger than 0x10D4 bytes; the legacy
+        # layout's is at least 806.
+        try:
+            parsed = RxGeneric.from_bytes(record)
+        except Exception:
+            parsed = None
+        task_data = (parsed.attribute(0x01) or b"") if parsed is not None else b""
+        if not isinstance(parsed, LegacyRxGeneric) and len(task_data) > 0x10D4:
+            current_offsets = True
+        elif len(record) > 0x112E:
+            # Any other record this large (unparseable, legacy, or with a short
+            # attribute 0x01) is read as laid out in the reference file; a
+            # mismatch shows up as an implausible scheduled-program count below.
+            task_data = bytes(record)[0x5A:]
+            current_offsets = True
+        else:
+            current_offsets = False
+        if current_offsets:
             rate_offset = 0x1012
             type_offset = 0x109C
             priority_offset = 0x109E
             watchdog_offset = 0x10B0
             disable_update = task_data[0x10D4]
-            program_offset = 0
+        elif parsed is None:
+            self._notes.warn(
+                f"Task '{name}': record could not be read; exported as a "
+                "periodic task with default settings and no programs",
+                f"object_id={self._object_id}",
+            )
+            return Task(name, name, "PERIODIC", "10", "10", "500", "false", "false", None, [])
         elif len(task_data) < 806:
             raise ValueError("Task record does not contain configuration data")
         else:
@@ -3551,7 +3635,6 @@ class TaskBuilder(L5xElementBuilder):
             priority_offset = 654
             watchdog_offset = 802
             disable_update = 0
-            program_offset = 0
 
         rate_us = struct.unpack_from("<I", task_data, rate_offset)[0]
         type_val = struct.unpack_from("<H", task_data, type_offset)[0]
@@ -3561,10 +3644,10 @@ class TaskBuilder(L5xElementBuilder):
         task_type = _TASK_TYPE_MAP.get(type_val, "PERIODIC")
         rate_str = str(rate_us // 1000) if task_type != "CONTINUOUS" else None
 
-        # Scheduled programs: ext[0x01] value starts at BLOB offset 0x5A.
-        # Format: u16 count followed by N u32 comment_ids.
-        prog_count = struct.unpack_from("<H", task_data, program_offset)[0]
-        max_program_count = (rate_offset - program_offset - 2) // 4
+        # Scheduled programs open attribute 0x01: a u16 count followed by
+        # that many u32 program schedule ids.
+        prog_count = struct.unpack_from("<H", task_data, 0)[0]
+        max_program_count = (rate_offset - 2) // 4
         scheduled_programs = []
         if prog_count > max_program_count:
             # The record does not match a known task layout; keep the task
@@ -3576,9 +3659,7 @@ class TaskBuilder(L5xElementBuilder):
             )
         else:
             for i in range(prog_count):
-                cid = struct.unpack_from(
-                    "<I", task_data, program_offset + 2 + i * 4
-                )[0]
+                cid = struct.unpack_from("<I", task_data, 2 + i * 4)[0]
                 prog_name = comment_id_to_program.get(cid)
                 if prog_name:
                     scheduled_programs.append(ScheduledProgram(prog_name, prog_name))
@@ -3609,6 +3690,57 @@ class ControllerBuilder(L5xElementBuilder):
     # Type layouts from the project's TagInfo.XML (see taginfo_layouts).
     _taginfo_layouts: Dict[str, "DataType"] = field(default_factory=dict)
 
+    def _programs(
+        self,
+        collection_id: int,
+        data_types_map: Dict[str, "DataType"],
+        value_types_map: Dict[str, "DataType"],
+        redundancy_enabled: bool,
+    ) -> List[Program]:
+        """The collection's programs. A program record can have a corrupt
+        attribute length partway through; it becomes an empty placeholder
+        rather than failing the project."""
+        programs: List[Program] = []
+        for pname, program_oid, _, rec in _get_program_records(self._cur, collection_id):
+            try:
+                programs.append(
+                    ProgramBuilder(
+                        self._cur, program_oid, data_types_map, redundancy_enabled,
+                        _value_types_map=value_types_map,
+                        _record=RxGeneric.from_bytes(rec), _notes=self._notes,
+                    ).build()
+                )
+            except Exception as e:
+                self._notes.warn(
+                    f"Program '{pname}': could not be read; exported as an "
+                    "empty placeholder",
+                    f"object_id={program_oid}, {type(e).__name__}: {e}",
+                )
+                programs.append(
+                    Program(pname, pname, "false", None, None,
+                             "false", None, "false", [], [])
+                )
+        return programs
+
+    def _program_schedule_ids(self, collection_id: int) -> Dict[int, str]:
+        """Task schedule ID -> program name, over every child of the program
+        collection. A program whose ID can't be read is still exported; it
+        just isn't listed in any task's schedule."""
+        self._cur.execute(
+            "SELECT comp_name, record FROM comps WHERE parent_id=?", (collection_id,)
+        )
+        schedule_ids: Dict[int, str] = {}
+        for pname, rec in self._cur.fetchall():
+            try:
+                schedule_ids[_program_schedule_id(RxGeneric.from_bytes(rec))] = pname
+            except Exception as e:
+                self._notes.warn(
+                    f"Program '{pname}': task-schedule ID could not be read; it "
+                    "won't appear in any task's scheduled-program list",
+                    f"{type(e).__name__}: {e}",
+                )
+        return schedule_ids
+
     def build(self) -> Controller:
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record_type, record FROM comps WHERE parent_id=0 AND record_type=256"
@@ -3628,6 +3760,7 @@ class ControllerBuilder(L5xElementBuilder):
         self._cur.execute(
             "SELECT tag_reference, record_string FROM comments WHERE parent="
             + str((r.comment_id * 0x10000) + r.cip_type)
+            + f" AND {_USER_COMMENT} ORDER BY rowid"
         )
         comment_results = self._cur.fetchall()
 
@@ -3759,51 +3892,10 @@ class ControllerBuilder(L5xElementBuilder):
             raise Exception("Contains more than one controller program collection")
 
         _program_collection_object_id = results[0][1]
-        # The collection's record_type 256 children are programs; every child
-        # goes into the task schedule ID -> program name map.
-        self._cur.execute(
-            "SELECT comp_name, object_id, record_type, record FROM comps WHERE parent_id=?",
-            (_program_collection_object_id,),
+        programs = self._programs(
+            _program_collection_object_id, data_types_map, value_types_map, redundancy_enabled
         )
-        programs: List[Program] = []
-        comment_id_to_program: Dict[int, str] = {}
-        schedule_notes: List[Tuple[str, str]] = []
-        for pname, program_oid, record_type, rec in self._cur.fetchall():
-            # A program record can have a corrupt attribute length partway
-            # through; export a placeholder rather than fail the project.
-            try:
-                r = RxGeneric.from_bytes(rec)
-                comment_id_to_program[_program_schedule_id(r)] = pname
-            except Exception as e:
-                r = None
-                schedule_notes.append((
-                    f"Program '{pname}': task-schedule ID could not be read; it "
-                    "won't appear in any task's scheduled-program list",
-                    f"{type(e).__name__}: {e}",
-                ))
-            if record_type != 256:
-                continue
-            try:
-                if r is None:
-                    raise ValueError("its record could not be parsed")
-                programs.append(
-                    ProgramBuilder(
-                        self._cur, program_oid, data_types_map, redundancy_enabled,
-                        _value_types_map=value_types_map, _record=r, _notes=self._notes,
-                    ).build()
-                )
-            except Exception as e:
-                self._notes.warn(
-                    f"Program '{pname}': could not be read; exported as an "
-                    "empty placeholder",
-                    f"object_id={program_oid}, {type(e).__name__}: {e}",
-                )
-                programs.append(
-                    Program(pname, pname, "false", None, None,
-                             "false", None, "false", [], [])
-                )
-        for note, detail in schedule_notes:
-            self._notes.warn(note, detail)
+        comment_id_to_program = self._program_schedule_ids(_program_collection_object_id)
 
         # Get the Task Collection and build Tasks
         self._cur.execute(

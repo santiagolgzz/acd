@@ -217,13 +217,26 @@ def _type1_comment(kind: int, text: bytes) -> bytes:
     return struct.pack("<I", len(body)) + body
 
 
-def test_type1_internal_string_records_are_skipped():
+def test_type1_internal_string_records_are_left_out_of_descriptions():
+    import sqlite3
+
+    from acd.l5x.elements import _own_description
     from acd.record.comments import CommentsRecord
 
-    real = _dat(_type1_comment(1, b"Made up note"))
-    member_name = _dat(_type1_comment(4, b"SomeMember"))
-    assert CommentsRecord.parse(real)[3] == "Made up note"
-    assert CommentsRecord.parse(member_name) is None
+    real = CommentsRecord.parse(_dat(_type1_comment(1, b"Made up note")))
+    member_name = CommentsRecord.parse(_dat(_type1_comment(4, b"SomeMember")))
+    assert real is not None and member_name is not None
+    assert (real[2], real[3]) == (1, "Made up note")
+    # Kept in the table (older rung comments number rungs in object_id) ...
+    assert (member_name[2], member_name[3]) == (4, "SomeMember")
+
+    # ... but never read as a description.
+    db = sqlite3.connect(":memory:")
+    cur = db.cursor()
+    cur.execute("CREATE TABLE comments(seq_number int, sub_record_length int, object_id int, record_string text,"
+                " record_type int, parent int, tag_reference text, rung_content int, member_ref int)")
+    cur.executemany("INSERT INTO comments VALUES (?,?,?,?,?,?,?,?,?)", [member_name, real])
+    assert _own_description(cur, 0x1A2B0068, None, 0x3C4D006D) == "Made up note"
 
 
 def test_notes_added_before_project_is_read_appear_in_comment():
@@ -292,11 +305,57 @@ def test_current_alias_resolves_module_tag_names():
     for object_id, name in rows:
         cur.execute("INSERT INTO comps VALUES (?, 0, ?, 0, 0, ?)", (object_id, name, b""))
     path = "@0a0b0c0d@.@01020304@.7\0".encode("utf-16-le")
-    assert TagBuilder(cur, 99)._legacy_alias_for(path) == "Rack7:5:O.Data.7"
+    assert TagBuilder(cur, 99)._resolve_alias_path(path) == "Rack7:5:O.Data.7"
 
     # An unresolvable target raises; the builder then exports a Base tag.
     with pytest.raises(ValueError):
-        TagBuilder(cur, 97)._legacy_alias_for("@0f0f0f0f@\0".encode("utf-16-le"))
+        TagBuilder(cur, 97)._resolve_alias_path("@0f0f0f0f@\0".encode("utf-16-le"))
+
+
+def _current_tag_record(name: str, alias_path=None) -> bytes:
+    from .rx_fixtures import rx_record
+
+    encoded = name.encode("utf-8")
+    attributes = struct.pack("<II", 0x01, 2 + len(encoded)) + struct.pack("<H", len(encoded)) + encoded
+    count = 1
+    if alias_path is not None:
+        attributes += struct.pack("<II", 0x65, len(alias_path)) + alias_path
+        count = 2
+    return rx_record(0x6B, 0x0123, attributes, count, length_extra=8)
+
+
+def test_current_alias_tags_through_tag_builder():
+    from loguru import logger
+
+    from acd.l5x.elements import TagBuilder
+    from .rx_fixtures import comps_database, insert_comp
+
+    connection, cur = comps_database()
+    cur.execute("CREATE TABLE taginfo_tags(program text, name text, data_type text)")
+    for object_id, name in [(0x11223344, "Rack7"), (0x0A0B0C0D, "&11223344:5:O"), (0x01020304, "Data")]:
+        insert_comp(cur, object_id, name, b"")
+    insert_comp(cur, 99, "MyAlias", _current_tag_record(
+        "MyAlias", "@0a0b0c0d@.@01020304@.7\0".encode("utf-16-le")))
+    insert_comp(cur, 98, "Plain", _current_tag_record("Plain"))
+    insert_comp(cur, 97, "Broken", _current_tag_record("Broken", "@0f0f0f0f@\0".encode("utf-16-le")))
+    warnings = []
+    sink = logger.add(warnings.append, level="WARNING")
+    try:
+        alias = TagBuilder(cur, 99).build()
+        assert (alias.tag_type, alias.alias_for) == ("Alias", "Rack7:5:O.Data.7")
+
+        # A tag with no alias path is not an alias.
+        plain = TagBuilder(cur, 98).build()
+        assert (plain.tag_type, plain.alias_for) == ("Base", None)
+        assert warnings == []
+
+        # An unresolvable alias falls back to a Base tag with a warning.
+        broken = TagBuilder(cur, 97).build()
+        assert (broken.tag_type, broken.alias_for) == ("Base", None)
+        assert len(warnings) == 1 and "Broken" in warnings[0]
+    finally:
+        logger.remove(sink)
+        connection.close()
 
 
 def test_current_alias_tag_matches_reference_export():

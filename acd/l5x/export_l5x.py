@@ -212,7 +212,7 @@ class ExportL5x:
         try:
             st_tuples = [
                 (comps_id, number, text)
-                for _name, comps_id, lines in STDecoder(self).all_routines()
+                for _name, comps_id, lines in self.st_decoder().all_routines()
                 for number, text in enumerate(lines)
             ]
             self._cur.executemany("INSERT INTO st_lines VALUES (?,?,?)", st_tuples)
@@ -260,6 +260,26 @@ class ExportL5x:
                 _taginfo_layouts=self._taginfo_layouts, _notes=self._notes,
             ).build()
         return self._controller
+
+    def st_decoder(self) -> "STDecoder":
+        """Return an STDecoder for this ACD file.
+
+        Must be called **before** accessing ``.project`` (which closes the
+        sqlite connection).  The returned :class:`STDecoder` holds its own
+        in-memory copy of all necessary data and remains usable after
+        ``.project`` is called.
+
+        Example::
+
+            exp = ExportL5x("project.acd")
+            dec = exp.st_decoder()          # create while DB is open
+            project = exp.project           # DB closes here; dec still works
+
+            for name, comps_id, lines in dec.all_routines():
+                print(f"{name}: {len(lines)} lines")
+        """
+        from acd.l5x.st_decoder import STDecoder  # local import avoids circular refs
+        return STDecoder(self)
 
     @property
     def project(self):

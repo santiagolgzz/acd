@@ -3,10 +3,16 @@ import struct
 import pytest
 
 from acd.l5x.conversion_notes import ConversionNotes
-from acd.l5x.elements import RoutineBuilder, TagBuilder, TaskBuilder, _program_schedule_id
+from acd.l5x.elements import (
+    ControllerBuilder,
+    RoutineBuilder,
+    TagBuilder,
+    TaskBuilder,
+    _program_schedule_id,
+)
 from acd.record.rx import LegacyRxGeneric, RxGeneric
 
-from .rx_fixtures import comps_database, insert_comp, protected_rx_record, rx_record
+from .rx_fixtures import comps_database, insert_comp, protected_rx_record, rx_header, rx_record
 
 
 def _metadata(name, runtime_type=0xC4, dimensions=(0, 0, 0), schedule_id=None):
@@ -463,12 +469,18 @@ def test_legacy_task_ignores_excess_program_count():
         database.close()
 
 
-def test_protected_routine_keeps_its_type():
-    # 14-byte header, 60-byte main record (type 1 = RLL at 0x30), then the
-    # encrypted envelope in place of the attributes.
+def _rll_main_record() -> bytes:
+    # 60-byte main record with routine type 1 (RLL) at 0x30.
     main = bytearray(60)
     struct.pack_into("<H", main, 0x30, 1)
-    record = protected_rx_record(0x6D, main=bytes(main))
+    return bytes(main)
+
+
+def test_protected_routine_keeps_its_type():
+    # 14-byte header, the main record, then an extended-attribute area whose
+    # lengths are unreadable (encrypted).
+    header = struct.pack("<IIHHH", 0, 0, 0, 0x6D, 0)
+    record = header + _rll_main_record() + struct.pack("<II", 999, 2) + struct.pack("<II", 0x01, 0x55555555)
     database, cursor = comps_database()
     try:
         insert_comp(cursor, 100, "Logic", record)
@@ -476,6 +488,146 @@ def test_protected_routine_keeps_its_type():
         routine = RoutineBuilder(cursor, 100, _notes=notes).build()
         assert (routine.type, routine.rungs) == ("RLL", [])
         assert "could not be read" in notes.current()[-1]
+    finally:
+        database.close()
+
+
+def test_protected_routine_with_envelope_marker_keeps_its_type():
+    # The encrypted envelope in place of the attributes.
+    record = protected_rx_record(0x6D, main=_rll_main_record())
+    database, cursor = comps_database()
+    try:
+        insert_comp(cursor, 100, "Logic", record)
+        notes = ConversionNotes()
+        routine = RoutineBuilder(cursor, 100, _notes=notes).build()
+        assert (routine.type, routine.rungs) == ("RLL", [])
+        assert "could not be read" in notes.current()[-1]
+    finally:
+        database.close()
+
+
+def _routine_tables(cursor):
+    cursor.execute("CREATE TABLE region_map(object_id int, parent_id int, unknown int)")
+    cursor.execute("CREATE TABLE rungs(object_id int, rung text)")
+    cursor.execute("CREATE TABLE rung_uids(object_id int, parent_id int, uid int)")
+    cursor.execute("CREATE TABLE comment_keys(object_id int, scope_key int, member_key int)")
+
+
+def test_older_rung_comments_use_object_id_as_rung_number():
+    # A routine with no owning scope key files rung comments under its own
+    # key, numbering rungs from 1 in object_id.
+    record = rx_header(0x6D, 0x0055, _rll_main_record(), unknown=0x10) + struct.pack("<II", 4, 0)
+    key = 0x0055 * 0x10000 + 0x6D
+    database, cursor = comps_database()
+    try:
+        _routine_tables(cursor)
+        insert_comp(cursor, 100, "Logic", record)
+        for index in range(3):
+            cursor.execute("INSERT INTO region_map VALUES (?, 100, ?)", (200 + index, index))
+            cursor.execute("INSERT INTO rungs VALUES (?, ?)", (200 + index, f"NOP();{index}"))
+        cursor.executemany(
+            "INSERT INTO comments VALUES (0, 0, ?, ?, 1, ?, '', ?, 0)",
+            [(1, "First rung", key, 7), (3, "Third rung", key, 7), (2, "Internal", key, 0)],
+        )
+        routine = RoutineBuilder(cursor, 100, _notes=ConversionNotes()).build()
+        assert routine._rung_comments == {0: "First rung", 2: "Third rung"}
+        # The internal string (object_id 2, no rung) is not the description.
+        assert routine._description is None
+    finally:
+        database.close()
+
+
+def test_controller_tag_comments_keep_file_order():
+    # The comments index sorts by (parent, member_ref); the tag still gets
+    # its comments in the order they were stored.
+    attributes = struct.pack("<II", 0x01, 3) + b"\x01\x00T"
+    record = rx_record(0x6B, 0x0077, attributes, 1, length_extra=8)
+    key = 0x0077 * 0x10000 + 0x6B
+    database, cursor = comps_database()
+    try:
+        cursor.execute("CREATE TABLE taginfo_tags(program text, name text, data_type text)")
+        cursor.execute("CREATE INDEX idx_comments_parent_member ON comments(parent, member_ref)")
+        insert_comp(cursor, 100, "T", record)
+        cursor.executemany(
+            "INSERT INTO comments VALUES (0, 0, 1, ?, 3, ?, ?, 0, ?)",
+            [("Stored first", key, ".A", 9), ("Stored second", key, ".B", 0)],
+        )
+        tag = TagBuilder(cursor, 100).build()
+        assert [text for _, text in tag._comments] == ["Stored first", "Stored second"]
+    finally:
+        database.close()
+
+
+def _program_collection(cursor, program_record: bytes):
+    insert_comp(cursor, 50, "RxProgramCollection", b"", parent_id=1)
+    insert_comp(cursor, 60, "MainProgram", program_record, parent_id=50)
+    insert_comp(cursor, 61, "RxRoutineCollection", b"", parent_id=60)
+    insert_comp(cursor, 62, "RxTagCollection", b"", parent_id=60)
+
+
+def test_program_without_schedule_id_is_still_built():
+    # Attribute 0x01 is too short for the schedule ID but holds the
+    # disabled flag (u32 0xFFFFFFFF at 0x24).
+    ext01 = bytearray(0x28)
+    struct.pack_into("<I", ext01, 0x24, 0xFFFFFFFF)
+    program = _legacy_rx(cip_type=0x68, attributes=[(0x01, bytes(ext01))])
+    database, cursor = comps_database()
+    try:
+        _program_collection(cursor, program)
+        notes = ConversionNotes()
+        builder = ControllerBuilder(cursor, 1, _notes=notes)
+        programs = builder._programs(50, {}, {}, False)
+        assert [(p.name, p.disabled) for p in programs] == [("MainProgram", "true")]
+        assert builder._program_schedule_ids(50) == {}
+        assert len(notes.current()) == 1
+        assert "task-schedule ID could not be read" in notes.current()[0]
+    finally:
+        database.close()
+
+
+def test_unreadable_program_is_a_placeholder():
+    database, cursor = comps_database()
+    try:
+        _program_collection(cursor, b"\x01\x02\x03")
+        notes = ConversionNotes()
+        programs = ControllerBuilder(cursor, 1, _notes=notes)._programs(50, {}, {}, False)
+        assert [(p.name, p.disabled, p.routines) for p in programs] == [("MainProgram", "false", [])]
+        assert "empty placeholder" in notes.current()[0]
+    finally:
+        database.close()
+
+
+def test_unparseable_large_task_reads_fixed_offsets():
+    # Attribute 0x01 starts at record offset 0x5A in the reference layout.
+    record = bytearray(0x1200)
+    struct.pack_into("<II", record, 74, 0x40, 5)
+    struct.pack_into("<II", record, 82, 0x01, 0xFFFFFF00)  # unreadable length
+    struct.pack_into("<HI", record, 0x5A, 1, 0x4242)
+    struct.pack_into("<I", record, 0x5A + 0x1012, 20_000)
+    struct.pack_into("<HH", record, 0x5A + 0x109C, 2, 7)
+    struct.pack_into("<I", record, 0x5A + 0x10B0, 300_000)
+    record[0x5A + 0x10D4] = 1
+    with pytest.raises(Exception):
+        RxGeneric.from_bytes(bytes(record))
+    database, cursor = comps_database()
+    try:
+        insert_comp(cursor, 100, "FastTask", bytes(record))
+        task = TaskBuilder(cursor, 100).build({0x4242: "MainProgram"})
+        assert (task.type, task.rate, task.priority, task.watchdog) == ("PERIODIC", "20", "7", "300")
+        assert task.disable_update_outputs == "true"
+        assert [p.name for p in task.scheduled_programs] == ["MainProgram"]
+    finally:
+        database.close()
+
+
+def test_unparseable_small_task_gets_defaults():
+    database, cursor = comps_database()
+    try:
+        insert_comp(cursor, 100, "BrokenTask", b"\x01\x02\x03")
+        notes = ConversionNotes()
+        task = TaskBuilder(cursor, 100, _notes=notes).build({})
+        assert (task.name, task.type, task.scheduled_programs) == ("BrokenTask", "PERIODIC", [])
+        assert "Task 'BrokenTask'" in notes.current()[0]
     finally:
         database.close()
 
