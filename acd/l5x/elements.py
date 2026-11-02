@@ -83,8 +83,9 @@ def _sanitize_path_component(name: str) -> str:
 class L5xElementBuilder:
     _cur: Cursor
     _object_id: int = -1
-    # Where fallback notes for this conversion go; pass the caller's along.
-    _notes: ConversionNotes = field(default_factory=ConversionNotes, kw_only=True)
+    # Where fallback notes for this conversion go; pass the caller's along by
+    # keyword. Subclass fields come after it, so they all need defaults.
+    _notes: ConversionNotes = field(default_factory=ConversionNotes)
 
 
 # Comment rows that hold user text. A type-1 row's object_id says what it
@@ -1905,9 +1906,9 @@ class DataTypeBuilder(L5xElementBuilder):
                 try:
                     children.append(
                         MemberBuilder(
-                            self._cur, child[1], bytes(extended_records[key]),
-                            offset60_to_name,
-                            last_hidden_backing,
+                            self._cur, child[1], record=bytes(extended_records[key]),
+                            _offset60_to_name=offset60_to_name,
+                            _fallback_target=last_hidden_backing,
                         ).build()
                     )
                 except Exception:
@@ -3705,7 +3706,8 @@ class ControllerBuilder(L5xElementBuilder):
             try:
                 programs.append(
                     ProgramBuilder(
-                        self._cur, program_oid, data_types_map, redundancy_enabled,
+                        self._cur, program_oid, _data_types_map=data_types_map,
+                        _redundancy_enabled=redundancy_enabled,
                         _value_types_map=value_types_map,
                         _record=RxGeneric.from_bytes(rec), _notes=self._notes,
                     ).build()
@@ -3963,7 +3965,7 @@ class ControllerBuilder(L5xElementBuilder):
             for _, mod_oid, _ in mod_rows:
                 modules.append(
                     ModuleBuilder(
-                        self._cur, mod_oid, modid_to_name,
+                        self._cur, mod_oid, _modid_to_name=modid_to_name,
                         _catalog_table=self._catalog_table,
                     ).build()
                 )
