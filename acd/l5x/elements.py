@@ -395,7 +395,7 @@ def _elements_xml(dims: List[int], values: List[Union[str, None]],
             f'<Element Index="{label}" Value="{value}"/>' for label, value in zip(labels, values)
         )
     return "".join(
-        f'<Element Index="{label}">{_structure_xml(struct_type, value)}</Element>'
+        f'<Element Index="{label}">{_structure_xml(struct_type, value or "")}</Element>'
         for label, value in zip(labels, values)
     )
 
@@ -819,10 +819,10 @@ def _decorated_from_data(dt_base: str, dimensions: Union[str, None], data: bytes
         return _data_xml(_structure_xml(_type_name(dt_base, data_types_map), inner))
 
     if dt_base == "BOOL":
-        values = [str((data[i // 8] >> (i % 8)) & 1) for i in range(total)]
+        values: List[Union[str, None]] = [str((data[i // 8] >> (i % 8)) & 1) for i in range(total)]
         return _data_xml(_array_xml("BOOL", dim_parts, "Decimal", _elements_xml(dim_parts, values)))
     if dt_base in _PRIMITIVE_FORMAT:
-        values = [
+        values: List[Union[str, None]] = [
             _format_number(dt_base, data[i * size : (i + 1) * size], l5k=False) for i in range(total)
         ]
         return _data_xml(_array_xml(
