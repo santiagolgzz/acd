@@ -1817,6 +1817,19 @@ class DataTypeBuilder(L5xElementBuilder):
         else:
             member_count = 0
 
+        size = (
+            struct.unpack("<I", extended_records[0x65])[0]
+            if len(extended_records.get(0x65, b"")) == 4
+            else 0
+        )
+
+        if isinstance(r, LegacyRxGeneric):
+            return DataType(
+                name, name, string_family, class_type,
+                self._legacy_members(extended_records, member_count),
+                self._legacy_description(), _size=size,
+            )
+
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record FROM comps WHERE parent_id="
             + str(self._object_id)
@@ -1884,12 +1897,58 @@ class DataTypeBuilder(L5xElementBuilder):
         if desc_row and desc_row[0]:
             description = desc_row[0]
 
-        size = (
-            struct.unpack("<I", extended_records[0x65])[0]
-            if len(extended_records.get(0x65, b"")) == 4
-            else 0
-        )
         return DataType(name, name, string_family, class_type, children, description, _size=size)
+
+    def _legacy_members(self, extended_records: Dict[int, bytes], member_count: int) -> List[Member]:
+        """Members of a legacy-layout (v20 and earlier) type.
+
+        These types have no member objects in Comps; each member is a record
+        inside the type's own record, at attribute 0x6E + index. The record
+        starts with the member name (UTF-16LE, NUL-terminated, 0x54 bytes)
+        and then uses the same offsets as a current-layout member record:
+        radix 0x54, type object 0x58, dimension 0x5C, byte offset 0x60, bit
+        0x64, hidden 0x70, external access 0x74. For a BIT member 0x68 is
+        the index of its host member (0x800 for any other member).
+        """
+        records = []
+        for idx in range(member_count):
+            rec = extended_records.get(0x6E + idx, b"")
+            if len(rec) < 0x78:
+                break
+            records.append(rec)
+        names = [rec[:0x54].decode("utf-16-le", errors="replace").split("\0")[0] for rec in records]
+
+        members: List[Member] = []
+        for rec, name in zip(records, names):
+            radix, type_id, dimension, offset, bit, host, _, hidden, access = struct.unpack_from(
+                "<9I", rec, 0x54
+            )
+            self._cur.execute("SELECT comp_name FROM comps WHERE object_id=?", (type_id,))
+            row = self._cur.fetchone()
+            data_type = row[0] if row else ""
+            target: Union[str, None] = None
+            bit_number: Union[int, None] = None
+            if data_type == "BOOL" and host != 0x800 and host < len(names):
+                data_type, dimension = "BIT", 0
+                target, bit_number = names[host], bit
+            members.append(Member(
+                name, name, data_type, dimension, radix_enum(radix), bool(hidden),
+                target, bit_number, external_access_enum(access),
+                _offset=offset, _bit=bit,
+            ))
+        return members
+
+    def _legacy_description(self) -> Union[str, None]:
+        """A legacy-layout type's description, filed under its own comment key."""
+        scope_key, _ = _legacy_comment_keys(self._cur, self._object_id)
+        if not scope_key:
+            return None
+        self._cur.execute(
+            f"SELECT record_string FROM comments WHERE parent=? AND member_ref=0 AND {_USER_COMMENT} LIMIT 1",
+            (scope_key,),
+        )
+        row = self._cur.fetchone()
+        return row[0] if row and row[0] else None
 
 
 @dataclass

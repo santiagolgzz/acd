@@ -4,7 +4,7 @@ import sqlite3
 import struct
 from types import SimpleNamespace
 
-from acd.l5x.elements import RoutineBuilder, TagBuilder
+from acd.l5x.elements import DataTypeBuilder, RoutineBuilder, TagBuilder
 from acd.record.comments import CommentsRecord
 from acd.record.comps import CompsRecord
 
@@ -136,4 +136,41 @@ def test_legacy_tag_description_and_bit_comments():
     assert "<Description>\n<![CDATA[Status flags]]>\n</Description>" in xml
     assert '<Comments><Comment Operand=".0">\n<![CDATA[Bit zero note]]>\n</Comment></Comments>' in xml
     assert "Another object" not in xml
+    db.close()
+
+
+def _legacy_member(name: str, radix: int, type_id: int, offset: int, bit: int, host: int, hidden: int) -> bytes:
+    # Name (UTF-16LE, 0x54 bytes), then radix, type object, dimension,
+    # offset, bit, host index (0x800: not a BIT), 0x6C, hidden, access.
+    return name.encode("utf-16-le").ljust(0x54, b"\0") + struct.pack(
+        "<9I", radix, type_id, 0, offset, bit, host, 0xFFFFFFFF, hidden, 1
+    ) + bytes(0x30)
+
+
+def test_legacy_data_type_members():
+    members = [
+        _legacy_member("ZZZZZZZZZZPump0", 4, 0x51, 0, 0, 0x800, 1),
+        _legacy_member("Run", 4, 0x52, 0, 3, 0, 0),
+        _legacy_member("Speed", 7, 0x53, 4, 0, 0x800, 0),
+    ]
+    attrs = [(0x64, struct.pack("<I", len(members))), (0x65, struct.pack("<I", 8))]
+    attrs += [(0x6E + i, m) for i, m in enumerate(members)]
+    db, cur = _database()
+    cur.executemany("INSERT INTO comps VALUES (?,?,?,0,0,?)", [
+        (0x51, 0, "SINT", b""), (0x52, 0, "BOOL", b""), (0x53, 0, "REAL", b""),
+        (0x99, 0, "Pump", _legacy_rx(0x6C, 0x99, attrs)),
+    ])
+    cur.execute("INSERT INTO comment_keys VALUES (0x99, 0x1234006C, 0)")
+    _comment(cur, 0x1234006C, 0, "Made up pump", record_type=1)
+
+    pump = DataTypeBuilder(cur, 0x99).build()
+    assert (pump.cls, pump._description) == ("User", "Made up pump")
+    host, run, speed = pump.members
+    assert (host.data_type, host.hidden, host.radix) == ("SINT", True, "Decimal")
+    assert (run.data_type, run.target, run.bit_number, run.dimension) == ("BIT", "ZZZZZZZZZZPump0", 3, 0)
+    assert (speed.name, speed.data_type, speed.radix) == ("Speed", "REAL", "Float")
+    assert speed.external_access == "Read/Write"
+    assert pump._size == 8
+    assert (run._offset, run._bit) == (0, 3)
+    assert speed._offset == 4
     db.close()
