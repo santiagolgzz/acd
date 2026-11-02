@@ -455,8 +455,8 @@ def test_own_description_skips_internal_type1_records():
             (object_id, text, record_type, 0x00010068),
         )
     try:
-        assert _own_description(cur, 0x00010068, 0) == "Made up note"
-        assert _own_description(cur, 0x00020068, 0) is None
+        assert _own_description(cur, 0x00010068, None, 0) == "Made up note"
+        assert _own_description(cur, 0x00020068, None, 0) is None
     finally:
         connection.close()
 

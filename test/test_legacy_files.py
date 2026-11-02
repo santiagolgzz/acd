@@ -5,7 +5,14 @@ import struct
 import xml.etree.ElementTree as ET
 from types import SimpleNamespace
 
-from acd.l5x.elements import DataTypeBuilder, RoutineBuilder, TagBuilder, taginfo_tags
+from acd.l5x.elements import (
+    ControllerBuilder,
+    DataTypeBuilder,
+    RoutineBuilder,
+    TagBuilder,
+    _own_description,
+    taginfo_tags,
+)
 from acd.record.comments import CommentsRecord
 from acd.record.comps import CompsRecord
 
@@ -50,6 +57,7 @@ def _database():
     cur.execute("CREATE TABLE region_map(object_id int, parent_id int, unknown int, seq_no int, record BLOB)")
     cur.execute("CREATE TABLE rungs(object_id int, rung text, seq_number int)")
     cur.execute("CREATE TABLE rung_uids(object_id int, parent_id int, uid int)")
+    cur.execute("CREATE TABLE taginfo_tags(program text, name text, data_type text)")
     return db, cur
 
 
@@ -188,7 +196,6 @@ def test_taginfo_tags():
 
 def test_unresolved_tag_type_comes_from_taginfo():
     db, cur = _database()
-    cur.execute("CREATE TABLE taginfo_tags(program text, name text, data_type text)")
     cur.executemany("INSERT INTO taginfo_tags VALUES (?, ?, ?)", [
         ("", "Alarm", "ALARM_DIGITAL"), ("", "Shared", "DINT"),
         ("ProgA", "Step", "TIMER"), ("ProgB", "Step", "COUNTER"), ("ProgA", "Other", "REAL"),
@@ -210,4 +217,50 @@ def test_unresolved_tag_type_comes_from_taginfo():
         cur.execute("INSERT INTO comps VALUES (?, ?, ?, 0, 0, ?)", (oid, collection, name, record))
     types = {oid: TagBuilder(cur, oid).build().data_type for oid, _, _ in tags}
     assert types == {0x52: "ALARM_DIGITAL", 0x53: "", 0x62: "COUNTER", 0x63: "", 0x64: ""}
+    db.close()
+
+
+def test_legacy_routine_description():
+    db, cur = _database()
+    _routine(cur)
+    cur.execute("INSERT INTO comment_keys VALUES (0x40, ?, ?)", (PROGRAM_KEY, ROUTINE_KEY))
+    _comment(cur, PROGRAM_KEY, ROUTINE_KEY, "Rung note", record_type=1, rung_content=0x000AFFEC)
+    _comment(cur, PROGRAM_KEY, ROUTINE_KEY, "Fills the hopper", record_type=1)
+    xml = RoutineBuilder(cur, 0x40).build().to_xml()
+    assert xml.startswith(
+        '<Routine Name="MainRoutine" Type="RLL"><Description>\n<![CDATA[Fills the hopper]]>\n</Description><RLLContent>'
+    )
+    db.close()
+
+
+def test_legacy_controller_description_under_its_own_key():
+    db, cur = _database()
+    controller_key, own_key = 0x00010069, 0x00020069
+    _comment(cur, own_key, 0, "Bit note", tag_reference=".0")
+    _comment(cur, own_key, 0, "Line 4 filler")
+    assert _own_description(cur, controller_key, own_key, 0) == "Line 4 filler"
+    assert _own_description(cur, controller_key, None, 0) is None
+    db.close()
+
+
+CONTROLLER_OWN_KEY = 0x00020069
+
+
+def _legacy_controller(cur):
+    """A legacy controller (object 1) with empty type, tag (3) and program
+    collections, whose own comment key comes from the record header."""
+    dates = [(0x65, bytes(8)), (0x66, bytes(8))]
+    record = _legacy_rx(0x69, 1, dates)
+    cur.execute("INSERT INTO comps VALUES (1, 0, 'Line4', 0, 256, ?)", (record,))
+    cur.execute("INSERT INTO comment_keys VALUES (1, ?, 0)", (CONTROLLER_OWN_KEY,))
+    for oid, name in ((2, "RxDataTypeCollection"), (3, "RxTagCollection"), (4, "RxProgramCollection")):
+        cur.execute("INSERT INTO comps VALUES (?, 1, ?, 0, 0, x'')", (oid, name))
+
+
+def test_legacy_controller_description_through_controller_builder():
+    db, cur = _database()
+    _legacy_controller(cur)
+    _comment(cur, CONTROLLER_OWN_KEY, 0, "Line 4 filler")
+    controller = ControllerBuilder(cur).build()
+    assert "<Description>\n<![CDATA[Line 4 filler]]>\n</Description>" in controller.to_xml()
     db.close()

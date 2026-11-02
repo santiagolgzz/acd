@@ -3019,15 +3019,22 @@ def _description_xml(text: Union[str, None]) -> str:
     return f"<Description>\n{_cdata_section(text)}\n</Description>" if text else ""
 
 
-def _own_description(cur: Cursor, parent: int, member_ref: int) -> Union[str, None]:
+def _own_description(cur: Cursor, parent: int, alt_parent: Union[int, None],
+                     member_ref: int) -> Union[str, None]:
     """An object's own description: the comment filed under its key with no
-    operand and no rung (parent = comment scope, member_ref = own key or 0)."""
+    operand and no rung (parent = comment scope, member_ref = own key or 0).
+    alt_parent is a second scope to look in (a legacy controller's own
+    comment key)."""
+    parents = [p for p in (parent, alt_parent) if p]
+    if not parents:
+        return None
     try:
         cur.execute(
-            "SELECT record_string FROM comments WHERE parent=? AND member_ref=? "
-            "AND rung_content=0 AND tag_reference='' "
+            "SELECT record_string FROM comments WHERE parent IN ("
+            + ",".join("?" * len(parents))
+            + ") AND member_ref=? AND rung_content=0 AND tag_reference='' "
             f"AND record_string!='' AND {_USER_COMMENT} ORDER BY rowid",
-            (parent, member_ref),
+            (*parents, member_ref),
         )
         row = cur.fetchone()
     except Exception:
@@ -3185,9 +3192,11 @@ class RoutineBuilder(L5xElementBuilder):
         # The routine's description: filed under its own key like its rung
         # comments, with no rung.
         if member_key:
-            description = _own_description(self._cur, scope_key, member_key)
+            description = _own_description(self._cur, scope_key, None, member_key)
         else:
-            description = _own_description(self._cur, (r.comment_id * 0x10000) + r.cip_type, 0)
+            description = _own_description(
+                self._cur, (r.comment_id * 0x10000) + r.cip_type, None, 0
+            )
 
         return Routine(
             name, name, routine_type, rungs, rung_ids, rung_comments, _description=description
@@ -3643,7 +3652,15 @@ class ControllerBuilder(L5xElementBuilder):
             raise Exception("Does not contain exactly one root controller node")
 
         r = RxGeneric.from_bytes(results[0][4])
-        description = _own_description(self._cur, (r.comment_id * 0x10000) + r.cip_type, 0)
+        # A legacy controller's description may also be filed under its own
+        # comment key.
+        description = _own_description(
+            self._cur,
+            (r.comment_id * 0x10000) + r.cip_type,
+            _legacy_comment_keys(self._cur, results[0][1])[0]
+            if isinstance(r, LegacyRxGeneric) else None,
+            0,
+        )
         self._cur.execute(
             "SELECT tag_reference, record_string FROM comments WHERE parent="
             + str((r.comment_id * 0x10000) + r.cip_type)
