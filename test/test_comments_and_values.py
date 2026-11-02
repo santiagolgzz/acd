@@ -435,3 +435,26 @@ def test_array_and_structure_tags():
 def test_nonfinite_real():
     assert _l5k_from_data("REAL", struct.pack("<f", float("nan"))) == "1.#QNAN000e+000"
     assert _l5k_from_data("REAL", struct.pack("<f", float("-inf"))) == "-1.#INF0000e+000"
+
+
+def test_own_description_skips_internal_type1_records():
+    from acd.l5x.elements import _own_description
+    from .rx_fixtures import comps_database
+
+    connection, cur = comps_database()
+    rows = [
+        # (object_id, text, record_type): an internal type-1 string (object_id 4),
+        # then the user's description (object_id 1).
+        (4, "SomeMember", 1),
+        (1, "Made up note", 1),
+    ]
+    for object_id, text, record_type in rows:
+        cur.execute(
+            "INSERT INTO comments VALUES (0, 0, ?, ?, ?, ?, '', 0, 0)",
+            (object_id, text, record_type, 0x00010068),
+        )
+    try:
+        assert _own_description(cur, 0x00010068, 0) == "Made up note"
+        assert _own_description(cur, 0x00020068, 0) is None
+    finally:
+        connection.close()
