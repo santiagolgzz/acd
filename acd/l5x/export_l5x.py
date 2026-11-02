@@ -1,8 +1,10 @@
 import argparse
 import os
+import re
 import sqlite3
 import struct
 import tempfile
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 from sqlite3 import Cursor
@@ -18,6 +20,7 @@ from acd.l5x.elements import (
     ControllerBuilder,
     ProjectBuilder,
     RSLogix5000Content,
+    taginfo_tags,
 )
 from acd.record.comments import CommentsRecord
 from acd.record.comps import CompsRecord
@@ -82,6 +85,7 @@ class ExportL5x:
         )
         log.debug("Create Comment_keys table in sqllite db")
         self._cur.execute("CREATE TABLE comment_keys(object_id int, scope_key int, member_key int)")
+        self._cur.execute("CREATE TABLE taginfo_tags(program text, name text, data_type text)")
         log.debug("Create Rung_uids table in sqllite db")
         self._cur.execute(
             "CREATE TABLE rung_uids(object_id int, parent_id int, uid int)"
@@ -174,6 +178,10 @@ class ExportL5x:
         # before its object_id (see populate_region_map/_parse_region_map).
         self._repair_region_map_gaps()
         self.populate_rung_uids()
+        taginfo = self._read_taginfo()
+        if taginfo is not None:
+            self._cur.executemany("INSERT INTO taginfo_tags VALUES (?,?,?)", taginfo_tags(taginfo))
+        self._db.commit()
 
         log.info(
             "Getting records from ACD Comments file and storing in sqllite database"
@@ -199,9 +207,25 @@ class ExportL5x:
         self._cur.execute("CREATE INDEX idx_rungs_object_id ON rungs(object_id)")
         self._cur.execute("CREATE INDEX idx_region_map_parent_id ON region_map(parent_id)")
         self._cur.execute("CREATE INDEX idx_rung_uids_parent_id ON rung_uids(parent_id)")
+        self._cur.execute("CREATE INDEX idx_taginfo_tags_name ON taginfo_tags(name)")
         self._cur.execute("CREATE INDEX idx_comment_keys_object_id ON comment_keys(object_id)")
         self._cur.execute("CREATE INDEX idx_comments_parent ON comments(parent)")
         self._db.commit()
+
+    def _read_taginfo(self) -> Union[ET.Element, None]:
+        """TagInfo.XML's root element, or None when it is missing or unreadable."""
+        path = os.path.join(self._temp_dir, "TagInfo.XML")
+        if not os.path.exists(path):
+            return None
+        with open(path, "rb") as f:
+            raw = f.read()
+        encoding = "utf-16" if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else "utf-8-sig"
+        text = raw.decode(encoding, errors="replace")
+        # ElementTree rejects an encoding declaration on an already-decoded str.
+        try:
+            return ET.fromstring(re.sub(r"^<\?xml[^>]*\?>", "", text.lstrip()))
+        except ET.ParseError:
+            return None
 
     @property
     def controller(self):

@@ -272,6 +272,7 @@ def test_current_alias_tags_through_tag_builder():
     from .rx_fixtures import comps_database, insert_comp
 
     connection, cur = comps_database()
+    cur.execute("CREATE TABLE taginfo_tags(program text, name text, data_type text)")
     for object_id, name in [(0x11223344, "Rack7"), (0x0A0B0C0D, "&11223344:5:O"), (0x01020304, "Data")]:
         insert_comp(cur, object_id, name, b"")
     insert_comp(cur, 99, "MyAlias", _current_tag_record(

@@ -2,9 +2,10 @@
 
 import sqlite3
 import struct
+import xml.etree.ElementTree as ET
 from types import SimpleNamespace
 
-from acd.l5x.elements import DataTypeBuilder, RoutineBuilder, TagBuilder
+from acd.l5x.elements import DataTypeBuilder, RoutineBuilder, TagBuilder, taginfo_tags
 from acd.record.comments import CommentsRecord
 from acd.record.comps import CompsRecord
 
@@ -173,4 +174,40 @@ def test_legacy_data_type_members():
     assert pump._size == 8
     assert (run._offset, run._bit) == (0, 3)
     assert speed._offset == 4
+    db.close()
+
+
+def test_taginfo_tags():
+    xml = (
+        '<LogixTagInfo><Tags><Tag Name="CtlTag" DataType="ALARM_DIGITAL"/></Tags>'
+        '<Programs><Program Name="Prog"><Tags><Tag Name="Local1" DataType="TIMER"/>'
+        '</Tags></Program></Programs></LogixTagInfo>'
+    )
+    assert sorted(taginfo_tags(ET.fromstring(xml))) == [("", "CtlTag", "ALARM_DIGITAL"), ("Prog", "Local1", "TIMER")]
+
+
+def test_unresolved_tag_type_comes_from_taginfo():
+    db, cur = _database()
+    cur.execute("CREATE TABLE taginfo_tags(program text, name text, data_type text)")
+    cur.executemany("INSERT INTO taginfo_tags VALUES (?, ?, ?)", [
+        ("", "Alarm", "ALARM_DIGITAL"), ("", "Shared", "DINT"),
+        ("ProgA", "Step", "TIMER"), ("ProgB", "Step", "COUNTER"), ("ProgA", "Other", "REAL"),
+    ])
+    # The controller (0x50, a root comp) owns tag collection 0x51; program
+    # ProgB (0x60, under program collection 0x5F) owns tag collection 0x61.
+    cur.execute("INSERT INTO comps VALUES (0x50, 0, 'Ctrl', 0, 256, x'')")
+    cur.execute("INSERT INTO comps VALUES (0x51, 0x50, 'Tags', 0, 0, x'')")
+    cur.execute("INSERT INTO comps VALUES (0x5F, 0x50, 'RxProgramCollection', 0, 0, x'')")
+    cur.execute("INSERT INTO comps VALUES (0x60, 0x5F, 'ProgB', 0, 256, x'')")
+    cur.execute("INSERT INTO comps VALUES (0x61, 0x60, 'Tags', 0, 0, x'')")
+    tags = [
+        (0x52, 0x51, "Alarm"), (0x53, 0x51, "Step"),
+        (0x62, 0x61, "Step"), (0x63, 0x61, "Shared"), (0x64, 0x61, "Other"),
+    ]
+    for oid, collection, name in tags:
+        # Runtime type 0 resolves no type from the tag's own records.
+        record = _legacy_rx(0x6B, oid, attributes=[(0x01, _metadata(name, 0))])
+        cur.execute("INSERT INTO comps VALUES (?, ?, ?, 0, 0, ?)", (oid, collection, name, record))
+    types = {oid: TagBuilder(cur, oid).build().data_type for oid, _, _ in tags}
+    assert types == {0x52: "ALARM_DIGITAL", 0x53: "", 0x62: "COUNTER", 0x63: "", 0x64: ""}
     db.close()

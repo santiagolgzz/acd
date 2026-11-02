@@ -894,6 +894,22 @@ def _decorated_from_data(dt_base: str, dimensions: Union[str, None], data: bytes
     return f'<Data Format="Decorated">\n<Array {attrs}>{"".join(elements)}</Array>\n</Data>'
 
 
+def taginfo_tags(root: ET.Element) -> List[Tuple[str, str, str]]:
+    """(program, tag name, data type) for every tag listed in TagInfo.XML.
+
+    Program is "" for controller-scope tags. Used only as a fallback when a
+    tag's own records don't resolve its data type.
+    """
+    rows: List[Tuple[str, str, str]] = []
+    for tags in root.findall("Tags"):
+        rows.extend(("", t.get("Name", ""), t.get("DataType", "")) for t in tags.findall("Tag"))
+    for program in root.iter("Program"):
+        tags = program.find("Tags")
+        for t in tags.findall("Tag") if tags is not None else []:
+            rows.append((program.get("Name", ""), t.get("Name", ""), t.get("DataType", "")))
+    return [row for row in rows if row[1] and row[2]]
+
+
 @dataclass
 class ProduceInfo(L5xElement):
     produce_count: str
@@ -2258,6 +2274,28 @@ class ModuleBuilder(L5xElementBuilder):
 
 @dataclass
 class TagBuilder(L5xElementBuilder):
+    def _taginfo_data_type(self, name: str) -> str:
+        # Fallback for tags whose records don't resolve a type (e.g. alarm
+        # tags in legacy files): TagInfo.XML lists every tag with its type.
+        # Only an entry in the tag's own scope counts: a tag collection's
+        # parent is the controller (the root comp) or the owning program.
+        self._cur.execute(
+            "SELECT o.comp_name, o.parent_id FROM comps t "
+            "JOIN comps c ON c.object_id = t.parent_id "
+            "JOIN comps o ON o.object_id = c.parent_id WHERE t.object_id=?",
+            (self._object_id,),
+        )
+        owner = self._cur.fetchone()
+        if owner is None:
+            return ""
+        program = "" if owner[1] == 0 else owner[0]
+        self._cur.execute(
+            "SELECT DISTINCT data_type FROM taginfo_tags WHERE name=? AND program=?",
+            (name, program),
+        )
+        rows = self._cur.fetchall()
+        return rows[0][0] if len(rows) == 1 else ""
+
     @staticmethod
     def _format_rpi(microseconds: int) -> str:
         if microseconds % 1000 == 0:
@@ -2521,6 +2559,8 @@ class TagBuilder(L5xElementBuilder):
                 if data is not None:
                     tag._data = data
             tag.usage = _program_tag_usage(r)
+        if not tag.data_type and tag.tag_type != "Alias":
+            tag.data_type = self._taginfo_data_type(tag.name) or tag.data_type
         return tag
 
     def _data_object_value(self, object_id: int) -> Union[bytes, None]:
