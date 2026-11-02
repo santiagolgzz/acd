@@ -441,6 +441,7 @@ def test_legacy_program_schedule_id_and_task():
     try:
         insert_comp(cursor, 100, "MainTask", task_record)
         task = TaskBuilder(cursor, 100).build({schedule_id: "MainProgram"})
+        assert task is not None
 
         assert task.type == "PERIODIC"
         assert task.rate == "10"
@@ -464,6 +465,7 @@ def test_legacy_task_ignores_excess_program_count():
         # An implausible count means an unknown task layout: keep the task,
         # drop the unreadable schedule list.
         task = TaskBuilder(cursor, 100).build({})
+        assert task is not None
         assert task.scheduled_programs == []
     finally:
         database.close()
@@ -613,6 +615,7 @@ def test_unparseable_large_task_reads_fixed_offsets():
     try:
         insert_comp(cursor, 100, "FastTask", bytes(record))
         task = TaskBuilder(cursor, 100).build({0x4242: "MainProgram"})
+        assert task is not None
         assert (task.type, task.rate, task.priority, task.watchdog) == ("PERIODIC", "20", "7", "300")
         assert task.disable_update_outputs == "true"
         assert [p.name for p in task.scheduled_programs] == ["MainProgram"]
@@ -620,13 +623,12 @@ def test_unparseable_large_task_reads_fixed_offsets():
         database.close()
 
 
-def test_unparseable_small_task_gets_defaults():
+def test_unparseable_small_task_is_left_out():
     database, cursor = comps_database()
     try:
         insert_comp(cursor, 100, "BrokenTask", b"\x01\x02\x03")
         notes = ConversionNotes()
-        task = TaskBuilder(cursor, 100, _notes=notes).build({})
-        assert (task.name, task.type, task.scheduled_programs) == ("BrokenTask", "PERIODIC", [])
+        assert TaskBuilder(cursor, 100, _notes=notes).build({}) is None
         assert "Task 'BrokenTask'" in notes.current()[0]
     finally:
         database.close()

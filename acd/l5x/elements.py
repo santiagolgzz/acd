@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from os import PathLike
 from pathlib import Path
 from sqlite3 import Cursor
-from typing import Any, List, NamedTuple, Tuple, Dict, Union
+from typing import Any, List, NamedTuple, Tuple, Dict, Optional, Union
 
 from loguru import logger as log
 
@@ -3587,7 +3587,7 @@ def _program_schedule_id(parsed: RxRecord) -> int:
 
 @dataclass
 class TaskBuilder(L5xElementBuilder):
-    def build(self, comment_id_to_program: Dict[int, str]) -> Task:
+    def build(self, comment_id_to_program: Dict[int, str]) -> Optional[Task]:
         self._cur.execute(
             "SELECT comp_name, record FROM comps WHERE object_id=" + str(self._object_id)
         )
@@ -3622,11 +3622,11 @@ class TaskBuilder(L5xElementBuilder):
             disable_update = task_data[0x10D4]
         elif parsed is None:
             self._notes.warn(
-                f"Task '{name}': record could not be read; exported as a "
-                "periodic task with default settings and no programs",
+                f"Task '{name}': record could not be read; the task is left "
+                "out and its programs are unscheduled",
                 f"object_id={self._object_id}",
             )
-            return Task(name, name, "PERIODIC", "10", "10", "500", "false", "false", None, [])
+            return None
         elif len(task_data) < 806:
             raise ValueError("Task record does not contain configuration data")
         else:
@@ -3913,7 +3913,9 @@ class ControllerBuilder(L5xElementBuilder):
                 + " AND record_type=256"
             )
             for task_result in self._cur.fetchall():
-                tasks.append(TaskBuilder(self._cur, task_result[1], _notes=self._notes).build(comment_id_to_program))
+                task = TaskBuilder(self._cur, task_result[1], _notes=self._notes).build(comment_id_to_program)
+                if task is not None:
+                    tasks.append(task)
 
         # Get the AOI Collection and get the AOIs
         results = _get_aoi_records(self._cur, self._object_id)
