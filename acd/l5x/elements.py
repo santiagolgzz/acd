@@ -1,4 +1,5 @@
 import html
+import math
 import os
 import re
 import shutil
@@ -752,6 +753,10 @@ def _format_number(dt_base: str, raw: bytes, l5k: bool) -> str:
         return str(value) if l5k else _format_time(dt_base, value)
     if dt_base not in ("REAL", "LREAL"):
         return str(value)
+    if math.isnan(value) or math.isinf(value):
+        # Logix spells non-finite floats the way the MSVC runtime prints them.
+        text = "1.#QNAN" if math.isnan(value) else ("-1.#INF" if value < 0 else "1.#INF")
+        return text + ("000e+000" if text.endswith("NAN") else "0000e+000") if l5k else text
     if l5k:
         # L5K writes floats as 0.00000000e+000 (three exponent digits).
         mantissa, exponent = f"{value:.8e}".split("e")

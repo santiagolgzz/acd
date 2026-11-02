@@ -430,3 +430,8 @@ def test_array_and_structure_tags():
     assert "<DataValue " not in array.to_xml()
     struct_tag = Tag("S", "S", "Base", "TIMER", "NullType", "Read/Write", None, None, 0, [])
     assert "Radix" not in _opening(struct_tag)
+
+
+def test_nonfinite_real():
+    assert _l5k_from_data("REAL", struct.pack("<f", float("nan"))) == "1.#QNAN000e+000"
+    assert _l5k_from_data("REAL", struct.pack("<f", float("-inf"))) == "-1.#INF0000e+000"
