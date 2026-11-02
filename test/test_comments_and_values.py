@@ -458,3 +458,40 @@ def test_own_description_skips_internal_type1_records():
         assert _own_description(cur, 0x00020068, 0) is None
     finally:
         connection.close()
+
+
+def test_operand_comments_follow_description():
+    comments = [
+        ("", "Whole tag"),
+        ("2", "Bit two"),
+        (".Member", "A member"),
+        ("[1]", "Second element"),
+        ("!internal", "Not an operand"),
+        ("2", "Later duplicate"),
+    ]
+    tag = Tag("T", "T", "Base", "MyType", None, "Read/Write", None, None, 0, comments)
+    element = ET.fromstring(tag.to_xml())
+    assert [child.tag for child in element][:2] == ["Description", "Comments"]
+    assert element.findtext("Description").strip() == "Whole tag"
+    assert [
+        (c.get("Operand"), c.text.strip()) for c in element.find("Comments")
+    ] == [(".2", "Bit two"), (".MEMBER", "A member"), ("[1]", "Second element")]
+
+
+
+def test_operand_comment_with_cdata_end_marker():
+    tag = Tag("T", "T", "Base", "MyType", None, "Read/Write", None, None, 0, [("2", "a]]>b")])
+    element = ET.fromstring(tag.to_xml())
+    assert element.find("Comments/Comment").text.strip() == "a]]>b"
+
+def test_operand_comments_match_reference_export(aoi_pair):
+    ours, ref = aoi_pair
+
+    def operand_comments(controller):
+        return {
+            (tag.get("Name"), c.get("Operand")): c.text.strip()
+            for tag in controller.iter("Tag")
+            for c in tag.findall("Comments/Comment")
+        }
+
+    assert operand_comments(ours) == operand_comments(ref)

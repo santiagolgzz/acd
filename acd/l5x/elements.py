@@ -1027,6 +1027,22 @@ class Tag(L5xElement):
         desc = self._sanitize_xml_text(desc_raw) if desc_raw else None
         desc_xml = f'<Description>\n<![CDATA[{desc}]]>\n</Description>' if desc else ""
 
+        # --- Comments child element: per-bit / per-member descriptions ---
+        # Stored tag_references omit the leading "." in current files (".2"
+        # is stored as "2"); references starting with "!" are not operands.
+        operand_comments: Dict[str, str] = {}
+        for ref, text in self._comments:
+            if not ref or ref == "." or ref.startswith("!") or not text:
+                continue
+            operand = ref if ref[0] in ".[" else "." + ref
+            operand_comments.setdefault(operand.upper(), text)
+        if operand_comments:
+            desc_xml += "<Comments>" + "".join(
+                f'<Comment Operand="{_escape_xml_attr(operand)}">\n'
+                f'{_cdata_section(self._sanitize_xml_text(text))}\n</Comment>'
+                for operand, text in operand_comments.items()
+            ) + "</Comments>"
+
         # --- Data child element(s) ---
         # Scalar primitives get Format="L5K" only.
         # Scalar STRING gets Format="L5K" (the L5K encoder handles it separately; we emit
