@@ -12,7 +12,7 @@ ExportL5x calls reset() when it starts.
 import re
 from typing import List
 
-# Characters that are illegal in XML 1.0 (same set as elements._XML_ILLEGAL_RE).
+# Characters that are illegal in XML 1.0. acd.l5x.elements imports this pattern.
 _XML_ILLEGAL_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f￾￿]")
 # XML forbids "--" inside a comment.
 _DOUBLE_HYPHEN_RE = re.compile("-{2,}")

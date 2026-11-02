@@ -16,13 +16,9 @@ from loguru import logger as log
 
 from acd.l5x import conversion_notes
 from acd.l5x.catalog_numbers import CATALOG_NUMBERS, catalog_number_for_identity
+from acd.l5x.conversion_notes import _XML_ILLEGAL_RE
 from acd.l5x.port_structures import PORT_STRUCTURES
 from acd.record.rx import LegacyRxGeneric, RxGeneric
-
-
-# Characters that are illegal in XML 1.0: everything outside
-# #x9 | #xA | #xD | #x20-#xD7FF | #xE000-#xFFFD | #x10000-#x10FFFF.
-_XML_ILLEGAL_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
 
 
 def _escape_xml_attr(value: object) -> str:
