@@ -33,7 +33,7 @@ seq:
   - id: extended_records
     type: attribute_record
     repeat: expr
-    repeat-expr: count_record - 1
+    repeat-expr: count_record
 
 types:
   attribute_record:

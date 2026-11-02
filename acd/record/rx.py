@@ -104,15 +104,27 @@ class LegacyRxGeneric:
 
 class RxGeneric:
     @staticmethod
+    def _current(raw: bytes):
+        try:
+            return GeneratedRxGeneric.from_bytes(raw)
+        except EOFError:
+            # The final attribute is cut short (the record lacks the four
+            # bytes past its stored length): read the ones before it.
+            count = struct.unpack_from("<I", raw, 78)[0]
+            parsed = GeneratedRxGeneric.from_bytes(raw[:78] + struct.pack("<I", max(count - 1, 0)) + raw[82:])
+            parsed.count_record = count
+            return parsed
+
+    @staticmethod
     def from_bytes(raw: bytes):
         raw = bytes(raw)
         # The stored length excludes the last four bytes of the final
         # attribute, which CompsRecord.parse keeps.
         if len(raw) >= 82 and struct.unpack_from("<I", raw, 74)[0] in (len(raw) - 74, len(raw) - 78):
-            return GeneratedRxGeneric.from_bytes(raw)
+            return RxGeneric._current(raw)
         if len(raw) >= 32 and struct.unpack_from("<I", raw, 24)[0] in (
             len(raw) - 28,
             len(raw) - 24,
         ):
             return LegacyRxGeneric(raw)
-        return GeneratedRxGeneric.from_bytes(raw)
+        return RxGeneric._current(raw)

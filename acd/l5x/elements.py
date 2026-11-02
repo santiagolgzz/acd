@@ -2892,35 +2892,25 @@ class ControllerBuilder(L5xElementBuilder):
         sfc_restart_position = _decode_utf16(0x70)
         sfc_last_scan = _decode_utf16(0x71)
 
-        # CommPath prefix (key 0x06A): may be in kaitai extended_records (usually empty),
-        # or in the LastAttributeRecord appended after the counted records (value length
-        # is stored as len_value where actual data = len_value - 4 bytes, UTF-16-LE).
+        # CommPath (key 0x06A), utf-16; usually the record's last attribute.
+        _cp_raw = extended_records.get(0x06A)
+        if r.count_record > len(r.extended_records):
+            # The final attribute was left out because the record lacks the
+            # four bytes past its stored length. If it is the CommPath, use
+            # the part that is there; when that ends with "\\" (the slot was
+            # in the missing bytes), the controller's slot is appended below.
+            _raw_record = bytes(results[0][4])
+            _offset = 82 + sum(8 + len(bytes(e.value)) for e in r.extended_records)
+            if len(_raw_record) >= _offset + 8:
+                _last_id, _last_len = struct.unpack_from("<II", _raw_record, _offset)
+                if _last_id == 0x06A:
+                    _cp_raw = _raw_record[_offset + 8 : _offset + 8 + _last_len]
+                    _cp_raw = _cp_raw[: len(_cp_raw) // 2 * 2]
         _comm_path_prefix: Union[str, None] = None
-        if 0x06A in extended_records:
-            _cp_raw = extended_records[0x06A]
+        if _cp_raw is not None:
             _cp_str = _cp_raw.decode("utf-16-le", errors="replace").rstrip("\x00")
             if _cp_str:
                 _comm_path_prefix = _cp_str
-        else:
-            # LastAttributeRecord tail: located after the (count_record - 1) parsed records.
-            # Header layout: parent_id(4) + unique_tag_id(4) + record_format_version(2) +
-            #   cip_type(2) + comment_id(2) = 14 bytes, then main_record(60), then
-            #   len_record(4) + count_record(4) = 82 bytes total before first AttributeRecord.
-            _raw_record = bytes(results[0][4])
-            _rec_offset = 82
-            for _er in r.extended_records:
-                _rec_offset += 4 + 4 + len(bytes(_er.value))
-            _tail = _raw_record[_rec_offset:]
-            if len(_tail) >= 8:
-                _last_attr_id = struct.unpack_from("<I", _tail, 0)[0]
-                _last_len_value = struct.unpack_from("<I", _tail, 4)[0]
-                if _last_attr_id == 0x06A and _last_len_value >= 4:
-                    _actual_len = _last_len_value - 4
-                    if len(_tail) >= 8 + _actual_len and _actual_len > 0:
-                        _cp_val = _tail[8: 8 + _actual_len]
-                        _cp_str = _cp_val.decode("utf-16-le", errors="replace").rstrip("\x00")
-                        if _cp_str:
-                            _comm_path_prefix = _cp_str
 
         if 0x75 in extended_records:
             sn_raw = hex(struct.unpack("<I", extended_records[0x75])[0])[2:].zfill(8)
@@ -3198,7 +3188,10 @@ class ControllerBuilder(L5xElementBuilder):
         # CommPath: combine the stored path prefix (ends with "\") with the controller
         # module's backplane slot number (e.g. "EthernetModule\192.168.1.10\Backplane\4").
         comm_path: Union[str, None] = None
-        if _comm_path_prefix is not None:
+        if _comm_path_prefix is not None and not _comm_path_prefix.endswith("\\"):
+            # The stored path already ends with the controller's slot.
+            comm_path = _comm_path_prefix
+        elif _comm_path_prefix is not None:
             _ctrl_slot = next(
                 (m._slot for m in modules if m.major_fault == "true"), None
             )
