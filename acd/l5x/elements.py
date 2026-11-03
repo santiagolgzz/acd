@@ -1533,6 +1533,8 @@ class Controller(L5xElement):
     # skips it in the base to_xml()); it is used only to build the <RedundancyInfo> element.
     _redundancy_enabled: bool = field(default=False)
     _description: Union[str, None] = field(default=None)
+    # Controller-scoped tags left out because they could not be read.
+    _skipped_tags: List[Dict[str, object]] = field(default_factory=list)
 
     def __post_init__(self):
         super().__post_init__()
@@ -3192,6 +3194,20 @@ class RoutineBuilder(L5xElementBuilder):
         except Exception:
             pass
 
+        # Some firmware revisions store the routine type in a record layout
+        # where the usual type field reads back 0 (TypeLess) even though the
+        # routine carries ladder logic. The rung text here comes from "Rung NT"
+        # SbRegion regions, which are RLL ladder rungs, so a TypeLess routine
+        # that actually has rungs is an RLL routine whose type byte could not be
+        # read from this layout. Classify it RLL so its logic is emitted instead
+        # of silently dropped (Routine.to_xml only serialises rungs for RLL).
+        if routine_type == "TypeLess" and rungs:
+            routine_type = "RLL"
+            self._notes.warn(
+                f"Routine '{name}' has no readable type but carries ladder "
+                "rungs; exported as RLL"
+            )
+
         # The routine's description: same key as its rung comments, no rung.
         if member_key:
             description = _own_description(self._cur, scope_key, None, member_key)
@@ -3903,9 +3919,31 @@ class ControllerBuilder(L5xElementBuilder):
         )
         results = self._cur.fetchall()
         tags: List[Tag] = []
+        # Tags that parse are exported; a tag this builder cannot faithfully
+        # reconstruct (an unexpected descriptor layout for this firmware, a
+        # dangling reference) is recorded and skipped rather than aborting the
+        # whole controller export. This keeps "emit L5X for the readable
+        # objects" honest: everything readable comes out, and what could not be
+        # rendered becomes a conversion note and is listed in _skipped_tags.
+        skipped_tags: List[Dict[str, object]] = []
         for result in results:
             _tag_object_id = result[1]
-            tag = TagBuilder(self._cur, _tag_object_id, _notes=self._notes).build()
+            tag_name = result[0]
+            try:
+                tag = TagBuilder(self._cur, _tag_object_id, _notes=self._notes).build()
+            except ValueError as exc:
+                self._notes.warn(
+                    f"Tag '{tag_name}' could not be read and was left out",
+                    f"object {_tag_object_id}: {exc}",
+                )
+                skipped_tags.append(
+                    {
+                        "name": tag_name,
+                        "object_id": _tag_object_id,
+                        "reason": str(exc),
+                    }
+                )
+                continue
             tag._data_types_map = data_types_map
             tag._value_types_map = value_types_map
             if (
@@ -4071,7 +4109,7 @@ class ControllerBuilder(L5xElementBuilder):
             if _ctrl_slot is not None:
                 comm_path = _comm_path_prefix + str(_ctrl_slot)
 
-        return Controller(
+        controller = Controller(
             controller_name,
             "Target",
             controller_name,
@@ -4104,6 +4142,10 @@ class ControllerBuilder(L5xElementBuilder):
             redundancy_enabled,
             description,
         )
+        # Diagnostics: controller-scoped tags that could not be faithfully
+        # reconstructed (see the tag loop above). Empty when everything parsed.
+        controller._skipped_tags = skipped_tags
+        return controller
 
 
 @dataclass

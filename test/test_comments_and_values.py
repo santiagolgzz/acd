@@ -1,6 +1,7 @@
 import os
 import struct
 import xml.etree.ElementTree as ET
+from pathlib import Path
 
 from acd.api import ImportProjectFromFile
 from acd.l5x import conversion_notes
@@ -462,3 +463,42 @@ def test_rung_text_with_invalid_utf16_is_kept(monkeypatch):
     entry = sbregion.SbRegionRecord.parse(_dat(b""), {}, notes.append)
     assert entry[1].startswith("NOP();")
     assert "not valid UTF-16" in notes[0]
+
+
+def test_unreadable_controller_tag_is_skipped_with_a_note(monkeypatch):
+    from acd.l5x import elements
+
+    build = elements.TagBuilder.build
+    seen = []
+
+    def failing_first_build(self):
+        tag = build(self)
+        if not seen and tag.name and ":" not in tag.name and not tag.name.startswith(("$", "_")):
+            seen.append(tag.name)
+            raise ValueError("made up layout problem")
+        return tag
+
+    monkeypatch.setattr(elements.TagBuilder, "build", failing_first_build)
+    export = ExportL5x(Path(AOI_ACD))
+    controller = export.controller
+    assert len(seen) == 1
+    assert [t["name"] for t in controller._skipped_tags] == seen
+    assert controller._skipped_tags[0]["reason"] == "made up layout problem"
+    assert seen[0] not in [t.name for t in controller.tags]
+    assert f"Tag '{seen[0]}' could not be read and was left out" in export.project.conversion_notes
+
+
+def test_typeless_routine_with_rungs_is_exported_as_rll(monkeypatch):
+    from acd.l5x import elements
+
+    original = elements.routine_type_enum
+    monkeypatch.setattr(
+        elements, "routine_type_enum",
+        lambda idx: "TypeLess" if idx == 1 else original(idx),
+    )
+    project = ExportL5x(Path(AOI_ACD)).project
+    notes = [n for n in project.conversion_notes if "no readable type" in n]
+    assert notes
+    xml_out = project.to_xml()
+    assert 'Type="TypeLess"' not in xml_out
+    assert "<Rung " in xml_out

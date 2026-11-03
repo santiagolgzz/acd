@@ -261,7 +261,7 @@ class ExportL5x:
             ).build()
         return self._controller
 
-    def st_decoder(self) -> "STDecoder":
+    def st_decoder(self) -> "STDecoder": # noqa
         """Return an STDecoder for this ACD file.
 
         Must be called **before** accessing ``.project`` (which closes the
