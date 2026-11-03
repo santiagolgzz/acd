@@ -137,3 +137,9 @@ def test_operand_comment_with_cdata_end_marker():
     tag = Tag("T", "T", "Base", "MyType", None, "Read/Write", None, None, 0, [("2", "a]]>b")])
     element = ET.fromstring(tag.to_xml())
     assert element.find("Comments/Comment").text.strip() == "a]]>b"
+
+
+def test_tag_description_with_cdata_end_marker():
+    tag = Tag("T", "T", "Base", "MyType", None, "Read/Write", None, None, 0, [("", "a]]>b")])
+    element = ET.fromstring(tag.to_xml())
+    assert element.findtext("Description").strip() == "a]]>b"
