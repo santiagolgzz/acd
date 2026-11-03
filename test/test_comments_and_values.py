@@ -239,6 +239,13 @@ def test_type1_internal_string_records_are_left_out_of_descriptions():
     assert _own_description(cur, 0x1A2B0068, None, 0x3C4D006D) == "Made up note"
 
 
+
+def test_largest_real_value():
+    # Rounding the largest finite REAL to 4 digits overflows a 32-bit float.
+    raw = struct.pack("<I", 0x7F7FFFFF)
+    xml = _decorated_from_data("REAL", "1", raw)
+    assert '<Element Index="[0]" Value="3.4028235e+38"/>' in xml
+
 def test_notes_added_before_project_is_read_appear_in_comment():
     export = ExportL5x(AOI_ACD)
     export._notes.add("Made up note: tag 'Fake' used a stand-in value")

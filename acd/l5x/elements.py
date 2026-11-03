@@ -744,7 +744,12 @@ def _format_number(dt_base: str, raw: bytes, l5k: bool) -> str:
         # Shortest text that reads back as the same 32-bit float.
         for precision in range(1, 10):
             text = f"{value:.{precision}g}"
-            if struct.pack("<f", float(text)) == raw:
+            try:
+                packed = struct.pack("<f", float(text))
+            except OverflowError:
+                # Rounded up past the largest finite REAL; try more digits.
+                continue
+            if packed == raw:
                 break
     else:
         text = repr(value)
