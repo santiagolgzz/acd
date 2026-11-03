@@ -131,3 +131,9 @@ def test_array_and_structure_tags():
     assert "<DataValue " not in array.to_xml()
     struct_tag = Tag("S", "S", "Base", "TIMER", "NullType", "Read/Write", None, None, 0, [])
     assert "Radix" not in _opening(struct_tag)
+
+
+def test_operand_comment_with_cdata_end_marker():
+    tag = Tag("T", "T", "Base", "MyType", None, "Read/Write", None, None, 0, [("2", "a]]>b")])
+    element = ET.fromstring(tag.to_xml())
+    assert element.find("Comments/Comment").text.strip() == "a]]>b"

@@ -1059,7 +1059,7 @@ class Tag(L5xElement):
         if operand_comments:
             desc_xml += "<Comments>" + "".join(
                 f'<Comment Operand="{_escape_xml_attr(operand)}">\n'
-                f'<![CDATA[{self._sanitize_xml_text(text)}]]>\n</Comment>'
+                f'{_cdata_section(self._sanitize_xml_text(text))}\n</Comment>'
                 for operand, text in operand_comments.items()
             ) + "</Comments>"
 
