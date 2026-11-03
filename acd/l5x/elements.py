@@ -886,22 +886,28 @@ def taginfo_layouts(root: ET.Element) -> Dict[str, "DataType"]:
     """
     layouts: Dict[str, DataType] = {}
     for dt in root.iter("DataType"):
-        members = []
-        for m in dt.findall("Members/Member"):
-            dims = [int(d.get("Size", "0")) for d in m.findall("Dimensions/Dim")]
-            dim = 1
-            for d in dims:
-                dim *= d
-            bit = m.get("Bit")
-            members.append(Member(
-                m.get("Name"), m.get("Name"), m.get("DataType", ""), dim if dims else 0,
-                "Decimal", m.get("Hidden") == "true", None,
-                int(bit) if bit is not None else None, "Read/Write",
-                _offset=int(m.get("Offset", "0")), _bit=int(bit) if bit is not None else 0,
-            ))
+        try:
+            members = []
+            for m in dt.findall("Members/Member"):
+                dims = [int(d.get("Size", "0")) for d in m.findall("Dimensions/Dim")]
+                dim = 1
+                for d in dims:
+                    dim *= d
+                bit = m.get("Bit")
+                members.append(Member(
+                    m.get("Name"), m.get("Name"), m.get("DataType", ""), dim if dims else 0,
+                    "Decimal", m.get("Hidden") == "true", None,
+                    int(bit) if bit is not None else None, "Read/Write",
+                    _offset=int(m.get("Offset", "0")), _bit=int(bit) if bit is not None else 0,
+                ))
+            size = int(dt.get("Size", "0"))
+        except ValueError:
+            # An empty or non-numeric size, offset or bit: the layout is
+            # unusable, so the type is decoded as if TagInfo.XML lacked it.
+            continue
         name = dt.get("Name", "")
         layouts[name.upper()] = DataType(
-            name, name, "NoFamily", "User", members, _size=int(dt.get("Size", "0"))
+            name, name, "NoFamily", "User", members, _size=size
         )
     return layouts
 
@@ -3156,6 +3162,7 @@ class RoutineBuilder(L5xElementBuilder):
         rung_comments: Dict[int, str] = {}
         scope_key, member_key = _comment_keys(self._cur, self._object_id, r)
         try:
+            index_by_uid: Dict[int, int] = {}
             if member_key:
                 # Rung comments sit in the program's comment scope with
                 # member_ref = the routine's own key, and the high half of
@@ -3168,6 +3175,7 @@ class RoutineBuilder(L5xElementBuilder):
                 index_by_uid = {
                     uid: position[oid] for oid, uid in self._cur.fetchall() if oid in position
                 }
+            if index_by_uid:
                 self._cur.execute(
                     "SELECT rung_content, record_string FROM comments "
                     "WHERE parent=? AND member_ref=? AND record_type=1 AND rung_content!=0 "
@@ -3179,8 +3187,9 @@ class RoutineBuilder(L5xElementBuilder):
                     if rung_index is not None and rec_str and rung_index not in rung_comments:
                         rung_comments[rung_index] = rec_str
             else:
-                # Older layout: comments under the routine's own key, with
-                # object_id as the 1-based rung index (rung 0 -> object_id=1).
+                # Older layout, or no rung uids recovered from RegnLink.Dat:
+                # comments under the routine's key, with object_id as the
+                # 1-based rung index (rung 0 -> object_id=1).
                 # These are the only rows read without the user-comment filter.
                 self._cur.execute(
                     "SELECT object_id, record_string FROM comments "
@@ -3828,9 +3837,22 @@ class ControllerBuilder(L5xElementBuilder):
         sfc_last_scan = _decode_utf16(0x71)
 
         # CommPath (key 0x06A), utf-16; usually the record's last attribute.
+        _cp_raw = extended_records.get(0x06A)
+        if r.count_record > len(r.extended_records):
+            # The final attribute was left out because the record lacks the
+            # four bytes past its stored length. If it is the CommPath, use
+            # the part that is there; when that ends with "\\" (the slot was
+            # in the missing bytes), the controller's slot is appended below.
+            _raw_record = bytes(results[0][4])
+            _offset = 82 + sum(8 + len(bytes(e.value)) for e in r.extended_records)
+            if len(_raw_record) >= _offset + 8:
+                _last_id, _last_len = struct.unpack_from("<II", _raw_record, _offset)
+                if _last_id == 0x06A:
+                    _cp_raw = _raw_record[_offset + 8 : _offset + 8 + _last_len]
+                    _cp_raw = _cp_raw[: len(_cp_raw) // 2 * 2]
         _comm_path_prefix: Union[str, None] = None
-        if 0x06A in extended_records:
-            _cp_str = extended_records[0x06A].decode("utf-16-le", errors="replace").rstrip("\x00")
+        if _cp_raw is not None:
+            _cp_str = _cp_raw.decode("utf-16-le", errors="replace").rstrip("\x00")
             if _cp_str:
                 _comm_path_prefix = _cp_str
 

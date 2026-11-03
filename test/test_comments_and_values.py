@@ -53,6 +53,21 @@ def test_rung_comment_matches_reference_export():
     assert commented == [("MainRoutine", "0", "Im a Rung Comment")]
 
 
+def test_rung_comment_without_rung_uids(monkeypatch):
+    # When RegnLink.Dat gives no rung uids for a routine, its rung comments
+    # are still looked up by rung position.
+    monkeypatch.setattr(ExportL5x, "_parse_rung_uids", staticmethod(lambda data, rungs: []))
+    project = ImportProjectFromFile(AOI_ACD).import_project()
+    controller = _controller(project.to_xml())
+    commented = [
+        (routine.get("Name"), rung.get("Number"), rung.find("Comment").text.strip())
+        for routine in controller.iter("Routine")
+        for rung in routine.iter("Rung")
+        if rung.find("Comment") is not None
+    ]
+    assert commented == [("MainRoutine", "0", "Im a Rung Comment")]
+
+
 def test_tag_descriptions_match_reference_export():
     def descriptions(controller):
         return {
@@ -249,6 +264,21 @@ def test_st_routine_without_lines_gets_a_note(monkeypatch):
     monkeypatch.setattr(STDecoder, "all_routines", lambda self: [])
     notes = ImportProjectFromFile(AOI_ACD).import_project().conversion_notes
     assert [n for n in notes if "Structured Text" in n] == [note]
+
+
+def test_taginfo_layouts_skip_unusable_sizes_and_offsets():
+    from acd.l5x.elements import taginfo_layouts
+
+    xml = (
+        '<LogixTagInfo><DataTypes>'
+        '<DataType Name="Seat" Size="12"><Members>'
+        '<Member Name="Pos" DataType="REAL" Offset="4"/></Members></DataType>'
+        '<DataType Name="NoSize" Size=""/>'
+        '<DataType Name="BadOffset" Size="4"><Members>'
+        '<Member Name="A" DataType="DINT" Offset="x"/></Members></DataType>'
+        '</DataTypes></LogixTagInfo>'
+    )
+    assert sorted(taginfo_layouts(ET.fromstring(xml))) == ["SEAT"]
 
 
 def test_largest_real_value():

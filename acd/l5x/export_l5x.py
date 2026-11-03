@@ -300,10 +300,12 @@ class ExportL5x:
         return self._project
 
     def populate_region_map(self, region_map_candidates: List[bytes]):
-        # A file can hold several Region Map records (stale copies among
-        # them). Use the largest one whose stored length checks out; only if
-        # none does, fall back to re-aligning the largest one against the
-        # known rung object_ids (see _parse_region_map).
+        # A file can hold several Region Map records, stale copies among
+        # them. Each copy whose stored length checks out is a candidate, and
+        # so is the copy kept in the comps table, re-aligned against known
+        # rungs if its length doesn't check out (see _parse_region_map). The
+        # candidate that places the most known rungs wins; on a tie, a copy
+        # whose length checks out, then the larger one.
         candidates = sorted(region_map_candidates, key=len, reverse=True)
 
         # Entries with a resolved object_id are inserted immediately. A
@@ -312,21 +314,50 @@ class ExportL5x:
         # which can only run once the `rungs` table exists.
         self._pending_region_map_gaps = []
 
-        if not candidates:
+        self._cur.execute(
+            "SELECT record FROM comps WHERE parent_id=0 AND comp_name='Region Map'"
+        )
+        row = self._cur.fetchone()
+        if row is None and not candidates:
             return
+        stored = bytes(row[0]) if row is not None else candidates[0]
 
         self._cur.execute("SELECT object_id FROM rungs")
         known_rung_ids = {row[0] for row in self._cur.fetchall()}
 
-        parsed = None
+        scored = []
+        stored_checks_out = False
         for record in candidates:
             try:
-                parsed = self._parse_region_map(record, strict=True)
-                break
+                entries = self._parse_region_map(record, strict=True)
             except ValueError:
                 continue
-        if parsed is None:
-            parsed = self._parse_region_map(candidates[0], known_rung_ids, warn=self._notes.warn)
+            scored.append((entries, True, len(record)))
+            stored_checks_out = stored_checks_out or record == stored
+        # Notes from re-aligning the comps-table copy, kept only if it is used.
+        realign_notes: List[str] = []
+        if not stored_checks_out:
+            try:
+                entries = self._parse_region_map(
+                    stored, known_rung_ids, warn=realign_notes.append
+                )
+            except ValueError:
+                if not scored:
+                    for note in realign_notes:
+                        self._notes.warn(note)
+                    raise
+            else:
+                scored.append((entries, False, len(stored)))
+
+        def rank(candidate):
+            entries, valid, size = candidate
+            placed = {e[0] for e in entries if e[0] in known_rung_ids}
+            return len(placed), valid, size
+
+        parsed, valid, _ = max(scored, key=rank)
+        if not valid:
+            for note in realign_notes:
+                self._notes.warn(note)
 
         complete_entries = []
         for object_id, parent_id, unknown, seq, raw in parsed:
