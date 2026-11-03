@@ -642,3 +642,40 @@ def test_rx_reads_final_attribute():
         (0x65, b"\x01\x02\x03\x04"),
         (0x01, b"abc"),
     ]
+
+
+def test_unresolved_tag_type_comes_from_taginfo_own_scope_first():
+    database, cursor = comps_database()
+    try:
+        cursor.execute("CREATE TABLE taginfo_tags(program text, name text, data_type text)")
+        cursor.executemany("INSERT INTO taginfo_tags VALUES (?, ?, ?)", [
+            ("", "Alarm", "ALARM_DIGITAL"), ("", "Shared", "DINT"),
+            ("ProgA", "Step", "TIMER"), ("ProgB", "Step", "COUNTER"), ("ProgA", "Other", "REAL"),
+        ])
+        # The controller (0x50, a root comp) owns tag collection 0x51; program
+        # ProgB (0x60, under program collection 0x5F) owns tag collection 0x61.
+        insert_comp(cursor, 0x50, "Ctrl", b"")
+        insert_comp(cursor, 0x51, "RxTagCollection", b"", parent_id=0x50, record_type=0)
+        insert_comp(cursor, 0x5F, "RxProgramCollection", b"", parent_id=0x50, record_type=0)
+        insert_comp(cursor, 0x60, "ProgB", b"", parent_id=0x5F)
+        insert_comp(cursor, 0x61, "RxTagCollection", b"", parent_id=0x60, record_type=0)
+        tags = [
+            (0x52, 0x51, "Alarm"), (0x53, 0x51, "Step"),
+            (0x62, 0x61, "Step"), (0x63, 0x61, "Shared"), (0x64, 0x61, "Other"),
+        ]
+        for oid, collection, name in tags:
+            # Runtime type 0 resolves no type from the tag's own records.
+            record = _legacy_rx(object_id=oid, attributes=[(0x01, _metadata(name, 0))])
+            insert_comp(cursor, oid, name, record, parent_id=collection, record_type=0)
+        notes = ConversionNotes()
+        types = {oid: TagBuilder(cursor, oid, _notes=notes).build().data_type for oid, _, _ in tags}
+        # Own scope first; otherwise other scopes, if they agree, with a note.
+        assert types == {0x52: "ALARM_DIGITAL", 0x53: "", 0x62: "COUNTER", 0x63: "DINT", 0x64: "REAL"}
+        assert notes.current() == [
+            "Tag 'Step': no data type; TagInfo.XML has no entry in its scope "
+            "and same-named tags in other scopes disagree",
+            "Tag 'Shared': data type DINT taken from a same-named tag in another scope of TagInfo.XML",
+            "Tag 'Other': data type REAL taken from a same-named tag in another scope of TagInfo.XML",
+        ]
+    finally:
+        database.close()

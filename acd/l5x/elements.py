@@ -2295,17 +2295,40 @@ class TagBuilder(L5xElementBuilder):
     def _taginfo_data_type(self, name: str) -> str:
         # Fallback for tags whose records don't resolve a type (e.g. alarm
         # tags in legacy files): TagInfo.XML lists every tag with its type.
-        self._cur.execute("SELECT program, data_type FROM taginfo_tags WHERE name=?", (name,))
+        # An entry in the tag's own scope comes first: a tag collection's
+        # parent is the controller (the root comp) or the owning program.
+        self._cur.execute(
+            "SELECT o.comp_name, o.parent_id FROM comps t "
+            "JOIN comps c ON c.object_id = t.parent_id "
+            "JOIN comps o ON o.object_id = c.parent_id WHERE t.object_id=?",
+            (self._object_id,),
+        )
+        owner = self._cur.fetchone()
+        if owner is not None:
+            program = "" if owner[1] == 0 else owner[0]
+            self._cur.execute(
+                "SELECT DISTINCT data_type FROM taginfo_tags WHERE name=? AND program=?",
+                (name, program),
+            )
+            rows = self._cur.fetchall()
+            if rows:
+                return rows[0][0] if len(rows) == 1 else ""
+        # No entry in its own scope: fall back to same-named tags elsewhere
+        # when they agree on one type.
+        self._cur.execute("SELECT DISTINCT data_type FROM taginfo_tags WHERE name=?", (name,))
         rows = self._cur.fetchall()
-        if len({data_type for _, data_type in rows}) == 1:
-            return rows[0][1]
-        self._cur.execute("SELECT parent_id FROM comps WHERE object_id=?", (self._object_id,))
-        parent = self._cur.fetchone()
-        owner = _routine_owner_name(self._cur, parent[0]) if parent else ""
-        scoped = [data_type for program, data_type in rows if program == owner]
-        if not scoped:
-            scoped = [data_type for program, data_type in rows if program == ""]
-        return scoped[0] if len(scoped) == 1 else ""
+        if len(rows) == 1:
+            self._notes.warn(
+                f"Tag '{name}': data type {rows[0][0]} taken from a same-named "
+                "tag in another scope of TagInfo.XML"
+            )
+            return rows[0][0]
+        if rows:
+            self._notes.warn(
+                f"Tag '{name}': no data type; TagInfo.XML has no entry in its "
+                "scope and same-named tags in other scopes disagree"
+            )
+        return ""
 
     @staticmethod
     def _format_rpi(microseconds: int) -> str:
