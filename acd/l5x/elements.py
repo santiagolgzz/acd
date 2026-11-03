@@ -1025,7 +1025,7 @@ class Tag(L5xElement):
         candidates = [text for ref, text in self._comments if ref in ("", ".") and text]
         desc_raw = max(candidates, key=len) if candidates else None
         desc = self._sanitize_xml_text(desc_raw) if desc_raw else None
-        desc_xml = f'<Description>\n<![CDATA[{desc}]]>\n</Description>' if desc else ""
+        desc_xml = f'<Description>\n{_cdata_section(desc)}\n</Description>' if desc else ""
 
         # --- Comments child element: per-bit / per-member descriptions ---
         # Stored tag_references omit the leading "." in current files (".2"

@@ -495,3 +495,9 @@ def test_operand_comments_match_reference_export(aoi_pair):
         }
 
     assert operand_comments(ours) == operand_comments(ref)
+
+
+def test_tag_description_with_cdata_end_marker():
+    tag = Tag("T", "T", "Base", "MyType", None, "Read/Write", None, None, 0, [("", "a]]>b")])
+    element = ET.fromstring(tag.to_xml())
+    assert element.findtext("Description").strip() == "a]]>b"
