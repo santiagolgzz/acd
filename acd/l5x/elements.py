@@ -3207,6 +3207,11 @@ class RoutineBuilder(L5xElementBuilder):
                 (self._object_id,),
             )
             st_lines = [row[0] for row in self._cur.fetchall()]
+            if not st_lines:
+                self._notes.warn(
+                    f"Structured Text routine '{name}' has no decoded lines; "
+                    "exported with an empty body"
+                )
 
         return Routine(
             name, name, routine_type, rungs, rung_ids, rung_comments,

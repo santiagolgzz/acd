@@ -240,6 +240,16 @@ def test_type1_internal_string_records_are_left_out_of_descriptions():
 
 
 
+def test_st_routine_without_lines_gets_a_note(monkeypatch):
+    from acd.l5x.st_decoder import STDecoder
+
+    note = "Structured Text routine 'STRoutine' has no decoded lines; exported with an empty body"
+    assert note not in ImportProjectFromFile(AOI_ACD).import_project().conversion_notes
+    monkeypatch.setattr(STDecoder, "all_routines", lambda self: [])
+    notes = ImportProjectFromFile(AOI_ACD).import_project().conversion_notes
+    assert [n for n in notes if "Structured Text" in n] == [note]
+
+
 def test_largest_real_value():
     # Rounding the largest finite REAL to 4 digits overflows a 32-bit float.
     raw = struct.pack("<I", 0x7F7FFFFF)
