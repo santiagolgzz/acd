@@ -2503,6 +2503,15 @@ class RoutineBuilder(L5xElementBuilder):
                     rung_index = obj_id - 1  # convert 1-based to 0-based
                     if rung_index >= 0 and rec_str and rung_index not in rung_comments:
                         rung_comments[rung_index] = rec_str
+                if member_key and rung_comments and rungs:
+                    # A current-layout routine whose rung ids could not be
+                    # recovered: its comments were placed by the older layout's
+                    # numbering, which may not match its rungs.
+                    self._notes.warn_grouped(
+                        "Routines whose rung comments could not be matched to "
+                        "rungs by id; placed by position, which may be wrong",
+                        name,
+                    )
         except Exception:
             pass
 

@@ -52,7 +52,7 @@ def test_rung_comment_without_rung_uids(monkeypatch):
     # When RegnLink.Dat gives no rung uids for a routine, its rung comments
     # are still looked up by rung position.
     monkeypatch.setattr(ExportL5x, "_parse_rung_uids", staticmethod(lambda data, rungs: []))
-    project = ImportProjectFromFile(AOI_ACD).import_project()
+    project = ExportL5x(AOI_ACD).project
     controller = _controller(project.to_xml())
     commented = [
         (routine.get("Name"), rung.get("Number"), rung.find("Comment").text.strip())
@@ -61,6 +61,12 @@ def test_rung_comment_without_rung_uids(monkeypatch):
         if rung.find("Comment") is not None
     ]
     assert commented == [("MainRoutine", "0", "Im a Rung Comment")]
+    # Placing comments by position is a guess, so it is noted; routines
+    # without rungs (FBD, SFC, ST) have no rung comments to place.
+    assert project.conversion_notes == [
+        "Routines whose rung comments could not be matched to rungs by id; "
+        "placed by position, which may be wrong: 'MainRoutine'"
+    ]
 
 
 def test_tag_descriptions_match_reference_export():
