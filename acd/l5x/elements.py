@@ -1114,6 +1114,42 @@ class Tag(L5xElement):
         return base[:insert_at] + data_xml + base[insert_at:]
 
 
+def _with_aoi_tag_children(base: str, description: Union[str, None], default_data: str) -> str:
+    """An AOI tag's XML with its Description and DefaultData inserted."""
+    children = ""
+    if description:
+        children += f'<Description>\n<![CDATA[{description}]]>\n</Description>'
+    children += default_data
+    idx = base.index(">")
+    return base[:idx + 1] + children + base[idx + 1:]
+
+
+def _default_data_xml(tag_name: str, radix: Union[str, None], members: Dict[str, "Member"],
+                      raw: bytes, data_types_map: Dict[str, "DataType"]) -> str:
+    """<DefaultData Format="Decorated"> of an AOI tag; "" if it can't be decoded.
+
+    raw is the data of the AOI's hidden default instance, laid out by the
+    AOI's data type.
+    """
+    member = members.get(tag_name)
+    if member is None:
+        return ""
+    fragment = _member_value_xml(member, raw, data_types_map)
+    if fragment is None:
+        return ""
+    # A top-level value has no member name.
+    fragment = re.sub(r' Name="[^"]*"', "", fragment, count=1)
+    fragment = re.sub(r"^<(/?)(DataValue|Structure|Array)Member\b", r"<\1\2", fragment)
+    fragment = re.sub(r"</(DataValue|Structure|Array)Member>$", r"</\1>", fragment)
+    mdt = member.data_type.upper()
+    if radix and not member.dimension and mdt in _PRIMITIVE_FORMAT:
+        # An atomic value is written in the tag's own radix.
+        size = struct.calcsize(_PRIMITIVE_FORMAT[mdt])
+        value = _radix_value(mdt, radix, raw[member._offset : member._offset + size])
+        fragment = f'<DataValue DataType="{mdt}" Radix="{radix}" Value="{value}"/>'
+    return f'<DefaultData Format="Decorated">\n{fragment}\n</DefaultData>'
+
+
 @dataclass
 class LocalTag(L5xElement):
     """Represents a local (non-public) tag inside an AOI (<LocalTag> in L5X)."""
@@ -1123,6 +1159,7 @@ class LocalTag(L5xElement):
     radix: Union[str, None]   # None for complex/UDT types (omitted from XML)
     external_access: str
     _description: Union[str, None] = field(default=None)
+    _default_data: str = ""
 
     def __post_init__(self):
         super().__post_init__()
@@ -1140,12 +1177,7 @@ class LocalTag(L5xElement):
         )
 
     def to_xml(self) -> str:
-        base = super().to_xml()
-        if not self._description:
-            return base
-        desc_xml = f'<Description>\n<![CDATA[{self._description}]]>\n</Description>'
-        idx = base.index(">")
-        return base[:idx + 1] + desc_xml + base[idx + 1:]
+        return _with_aoi_tag_children(super().to_xml(), self._description, self._default_data)
 
 
 @dataclass
@@ -1162,6 +1194,7 @@ class Parameter(L5xElement):
     constant: Union[str, None]  # "false" for non-MESSAGE InOut, None otherwise (omitted)
     dimensions: Union[str, None]  # array size; None for scalars (omitted from XML)
     _description: Union[str, None] = field(default=None)
+    _default_data: str = ""
 
     def __post_init__(self):
         super().__post_init__()
@@ -1175,12 +1208,7 @@ class Parameter(L5xElement):
         )
 
     def to_xml(self) -> str:
-        base = super().to_xml()
-        if not self._description:
-            return base
-        desc_xml = f'<Description>\n<![CDATA[{self._description}]]>\n</Description>'
-        idx = base.index(">")
-        return base[:idx + 1] + desc_xml + base[idx + 1:]
+        return _with_aoi_tag_children(super().to_xml(), self._description, self._default_data)
 
 
 @dataclass
@@ -2820,14 +2848,108 @@ def _program_tag_usage(r: RxRecord) -> Union[str, None]:
     return None
 
 
-def _aoi_tag_usage_flags(ext01: bytes) -> int:
-    """Return the usage-flags byte from an AOI tag record's ext[0x01] blob.
+def _aoi_tag_usage_flags(ext01: bytes, legacy: bool = False) -> int:
+    """Return an AOI tag's usage flags from its ext[0x01] blob.
 
     Returns 0 if the record is too short.  The caller is responsible for
     interpreting the bits (0x04=Input, 0x08=Output; both set = InOut;
-    neither set = local tag).
+    neither set = local tag; 0x20=Required; 0x40=Visible).
+
+    The legacy layout (v20 and earlier) stores the same facts elsewhere: usage
+    in the u16 at 0x20E (0x80=Input, 0x100=Output, 0x200=local) and Required
+    and Visible in the byte at 0x105 (0x80, 0x40).
     """
-    return ext01[0x20E] if len(ext01) > 0x20E else 0
+    if len(ext01) <= 0x20F:
+        return 0
+    if not legacy:
+        return ext01[0x20E]
+    usage = struct.unpack_from("<H", ext01, 0x20E)[0]
+    flags = 0
+    if usage & 0x80:
+        flags |= 0x04
+    if usage & 0x100:
+        flags |= 0x08
+    if ext01[0x105] & 0x80:
+        flags |= 0x20
+    if ext01[0x105] & 0x40:
+        flags |= 0x40
+    return flags
+
+
+# Structure handles of built-in types; an InOut parameter of the legacy layout
+# stores only this handle because it has no member in the backing data type.
+_LEGACY_BUILTIN_STRUCTURES = {
+    0x0F82: "COUNTER",
+    0x0F83: "TIMER",
+    0x0F84: "CONTROL",
+    0x0FCE: "STRING",
+}
+_LEGACY_ATOMIC_TYPES = {
+    0xC1: "BOOL",
+    0xC2: "SINT",
+    0xC3: "INT",
+    0xC4: "DINT",
+    0xC5: "LINT",
+    0xC6: "USINT",
+    0xC7: "UINT",
+    0xC8: "UDINT",
+    0xC9: "ULINT",
+    0xCA: "REAL",
+    0xCB: "LREAL",
+}
+
+
+def _aoi_backing_members(cur, aoi_name: str) -> Dict[str, "Member"]:
+    """Members of the data type Logix creates for an AOI, by name.
+
+    Legacy-layout AOI tags don't hold their type or array size; the matching
+    member of this data type does. InOut parameters have no member.
+    """
+    cur.execute(
+        "SELECT c.object_id FROM comps c JOIN comps p ON c.parent_id = p.object_id "
+        "WHERE p.comp_name='RxDataTypeCollection' AND c.comp_name=?",
+        (aoi_name,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return {}
+    try:
+        return {m.name: m for m in DataTypeBuilder(cur, row[0]).build().members}
+    except Exception as e:
+        log.debug(f"Backing data type of AOI {aoi_name} could not be read: {e}")
+        return {}
+
+
+def _legacy_aoi_tag_type(
+    r: "LegacyRxGeneric", member: Union["Member", None]
+) -> Tuple[str, Union[str, None]]:
+    """(data type, dimensions) of a legacy-layout AOI tag; "" if unknown."""
+    if member is not None:
+        # A BOOL inside the backing structure is stored as a BIT member.
+        data_type = "BOOL" if member.data_type == "BIT" else member.data_type
+        return data_type, str(member.dimension) if member.dimension else None
+    runtime_type = r.main_record.runtime_type
+    if runtime_type & 0x8000:
+        return _LEGACY_BUILTIN_STRUCTURES.get(runtime_type & 0x7FFF, ""), None
+    return _LEGACY_ATOMIC_TYPES.get(runtime_type & 0xFF, ""), None
+
+
+def _aoi_tag_description(cur, object_id: int, r: RxRecord, raw_rec: bytes) -> Union[str, None]:
+    """Description of an AOI parameter or local tag, from the comments table."""
+    if isinstance(r, LegacyRxGeneric):
+        scope_key, member_ref = _legacy_comment_keys(cur, object_id)
+    else:
+        # Bytes [14:18] of the comps record identify the tag's own description.
+        scope_key = (r.comment_id * 0x10000) + r.cip_type
+        member_ref = struct.unpack_from("<I", raw_rec, 14)[0] if len(raw_rec) >= 18 else 0
+    if not member_ref:
+        return None
+    cur.execute(
+        f"SELECT record_string FROM comments WHERE parent=? AND member_ref=? AND {_USER_COMMENT} LIMIT 1",
+        (scope_key, member_ref),
+    )
+    row = cur.fetchone()
+    return row[0] if row and row[0] else None
 
 
 def _aoi_tag_data_type(cur, raw_rec: bytes) -> str:
@@ -2847,6 +2969,9 @@ def _aoi_tag_data_type(cur, raw_rec: bytes) -> str:
 @dataclass
 class ParameterBuilder(L5xElementBuilder):
     """Build a Parameter from an AOI RxTagCollection child record."""
+
+    # The AOI's backing data type members, which hold legacy-layout tag types.
+    _members: Dict[str, "Member"] = field(default_factory=dict)
 
     def build(self) -> Parameter:
         self._cur.execute(
@@ -2871,8 +2996,17 @@ class ParameterBuilder(L5xElementBuilder):
         except Exception:
             return Parameter(name, name, "Base", data_type, "Input", None, "false", "false", "Read/Write", None, dimensions)
 
+        if isinstance(r, LegacyRxGeneric):
+            data_type, dimensions = _legacy_aoi_tag_type(r, self._members.get(name))
+            if not data_type:
+                self._notes.warn(
+                    f"Add-On Instruction parameter '{name}': its data type isn't stored in a "
+                    "readable form and was left blank",
+                    f"structure handle {hex(r.main_record.runtime_type)}",
+                )
+
         ext01 = exts.get(0x01, b"")
-        flags = _aoi_tag_usage_flags(ext01)
+        flags = _aoi_tag_usage_flags(ext01, isinstance(r, LegacyRxGeneric))
 
         usage_bits = flags & 0x0C
         if usage_bits == 0x04:
@@ -2908,20 +3042,7 @@ class ParameterBuilder(L5xElementBuilder):
             radix_idx = ext01[0x20F] >> 4
             radix = radix_enum(radix_idx) if radix_idx != 0 else None
 
-        # --- Description ---
-        # Use bytes [14:18] of the comps record as member_ref to identify the
-        # specific parameter description in the comments table.
-        description: Union[str, None] = None
-        if len(raw_rec) >= 18:
-            member_ref = struct.unpack_from("<I", raw_rec, 14)[0]
-            if member_ref:
-                self._cur.execute(
-                    f"SELECT record_string FROM comments WHERE parent=? AND member_ref=? AND {_USER_COMMENT} LIMIT 1",
-                    ((r.comment_id * 0x10000) + r.cip_type, member_ref),
-                )
-                desc_row = self._cur.fetchone()
-                if desc_row and desc_row[0]:
-                    description = desc_row[0]
+        description = _aoi_tag_description(self._cur, self._object_id, r, raw_rec)
 
         return Parameter(
             name,
@@ -2942,6 +3063,9 @@ class ParameterBuilder(L5xElementBuilder):
 @dataclass
 class LocalTagBuilder(L5xElementBuilder):
     """Build a LocalTag from an AOI RxTagCollection child record."""
+
+    # The AOI's backing data type members, which hold legacy-layout tag types.
+    _members: Dict[str, "Member"] = field(default_factory=dict)
 
     def build(self) -> LocalTag:
         self._cur.execute(
@@ -2966,6 +3090,9 @@ class LocalTagBuilder(L5xElementBuilder):
         except Exception:
             return LocalTag(name, name, data_type, dimensions, None, "Read/Write")
 
+        if isinstance(r, LegacyRxGeneric):
+            data_type, dimensions = _legacy_aoi_tag_type(r, self._members.get(name))
+
         ext01 = exts.get(0x01, b"")
         if len(ext01) > 0x21F:
             ea_val = struct.unpack_from("<H", ext01, 0x21E)[0]
@@ -2979,20 +3106,7 @@ class LocalTagBuilder(L5xElementBuilder):
         else:
             radix = None
 
-        # --- Description ---
-        # Use bytes [14:18] of the comps record as member_ref to identify the
-        # specific local tag description in the comments table.
-        description: Union[str, None] = None
-        if len(raw_rec) >= 18:
-            member_ref = struct.unpack_from("<I", raw_rec, 14)[0]
-            if member_ref:
-                self._cur.execute(
-                    f"SELECT record_string FROM comments WHERE parent=? AND member_ref=? AND {_USER_COMMENT} LIMIT 1",
-                    ((r.comment_id * 0x10000) + r.cip_type, member_ref),
-                )
-                desc_row = self._cur.fetchone()
-                if desc_row and desc_row[0]:
-                    description = desc_row[0]
+        description = _aoi_tag_description(self._cur, self._object_id, r, raw_rec)
 
         return LocalTag(name, name, data_type, dimensions, radix, external_access, description)
 
@@ -3307,7 +3421,8 @@ def _parse_aoi_nameless(data: bytes) -> dict:
     # SoftwareRevision (current)
     result["software_revision"], offset = _parse_fffeff(data, offset)
 
-    # 4 bytes (01 00 00 00)
+    # Revision: major and minor, u16 each
+    result["revision"] = struct.unpack_from("<HH", data, offset)
     offset += 4
 
     # RevisionExtension
@@ -3350,6 +3465,57 @@ def _aoi_data_type_description(cur, name: str) -> Union[str, None]:
 
 @dataclass
 class AoiBuilder(L5xElementBuilder):
+    # Type layouts for decoding the default values of the AOI's tags.
+    _value_types_map: Dict[str, "DataType"] = field(default_factory=dict)
+
+    def _default_instance(self, name: str) -> Union[bytes, None]:
+        """Data of the AOI's default instance: a system tag named __DEFVAL_<id>
+        that is of the AOI's type."""
+        self._cur.execute("SELECT record FROM comps WHERE comp_name LIKE '\\_\\_DEFVAL\\_%' ESCAPE '\\'")
+        for (record,) in self._cur.fetchall():
+            try:
+                raw = bytes(record)
+                r = RxGeneric.from_bytes(raw)
+                data_object = self._cur.execute(
+                    "SELECT record FROM comps WHERE object_id=?", (r.data_object_id,)
+                ).fetchone()
+                if data_object is None:
+                    continue
+                data = RxGeneric.from_bytes(bytes(data_object[0]))
+                if isinstance(r, LegacyRxGeneric):
+                    type_id = data.data_instance_id
+                else:
+                    type_id = struct.unpack_from("<I", raw, 0x2A)[0]
+                type_row = self._cur.execute(
+                    "SELECT comp_name FROM comps WHERE object_id=?", (type_id,)
+                ).fetchone()
+                if type_row and type_row[0].upper() == name.upper():
+                    value = data.attribute(0x66)
+                    return bytes(value) if value else None
+            except Exception as e:
+                log.debug(f"Default values of AOI {name} could not be read: {e}")
+        return None
+
+    def _set_default_data(self, name: str,
+                          parameters: List[Parameter], local_tags: List[LocalTag]) -> None:
+        """Fill in tags' default values from the AOI's default instance."""
+        raw = self._default_instance(name)
+        layout = self._value_types_map.get(name.upper())
+        if not raw or layout is None:
+            return
+        members = {m.name: m for m in layout.members}
+        tags: List[Union[Parameter, LocalTag]] = [
+            # InOut parameters are references and the system parameters have
+            # no default of their own.
+            p for p in parameters
+            if p.usage != "InOut" and p.name not in ("EnableIn", "EnableOut")
+        ]
+        tags.extend(local_tags)
+        for tag in tags:
+            tag._default_data = _default_data_xml(
+                tag.name, tag.radix, members, raw, self._value_types_map
+            )
+
     def _routines(self) -> List[Routine]:
         routines: List[Routine] = []
         self._cur.execute(
@@ -3410,8 +3576,18 @@ class AoiBuilder(L5xElementBuilder):
         revision = f"{rev_major}.{rev_minor}"
 
         # --- Vendor from comps record ---
-        vlen = struct.unpack_from("<H", aoi_record, 0xA6)[0] if len(aoi_record) > 0xA8 else 0
-        vendor: Union[str, None] = aoi_record[0xA8:0xA8+vlen].decode("utf-8", errors="replace") if vlen > 0 else None
+        # The legacy layout (v20 and earlier) stores it later in the record.
+        vendor_offset = 0xF8 if isinstance(_r_aoi, LegacyRxGeneric) else 0xA6
+        vlen = (
+            struct.unpack_from("<H", aoi_record, vendor_offset)[0]
+            if len(aoi_record) > vendor_offset + 2
+            else 0
+        )
+        vendor: Union[str, None] = (
+            aoi_record[vendor_offset + 2 : vendor_offset + 2 + vlen].decode("utf-8", errors="replace")
+            if vlen > 0
+            else None
+        )
 
         # --- Metadata from large nameless record ---
         self._cur.execute(
@@ -3425,6 +3601,11 @@ class AoiBuilder(L5xElementBuilder):
             meta = {"created_by": "", "created_date": "", "edited_by": "", "edited_date": "",
                     "software_revision": "", "revision_extension": None}
 
+        stored_revision = meta.get("revision")
+        if isinstance(_r_aoi, LegacyRxGeneric) and isinstance(stored_revision, tuple):
+            # The legacy layout has no revision in ext[0x01].
+            revision = f"{stored_revision[0]}.{stored_revision[1]}"
+
         parameters: List[Parameter] = []
         local_tags: List[LocalTag] = []
 
@@ -3437,14 +3618,27 @@ class AoiBuilder(L5xElementBuilder):
         tag_coll_row = self._cur.fetchone()
         if tag_coll_row:
             tag_coll_oid = tag_coll_row[0]
+            members = (
+                _aoi_backing_members(self._cur, name)
+                if isinstance(_r_aoi, LegacyRxGeneric)
+                else {}
+            )
             self._cur.execute(
                 "SELECT object_id, record FROM comps WHERE parent_id="
                 + str(tag_coll_oid)
                 + " AND record_type != 512"
                 + " ORDER BY seq_number"
             )
-            for child_oid, child_rec in self._cur.fetchall():
-                child_rec = bytes(child_rec)
+            # Each record's header holds its position in the AOI's definition,
+            # 4 bytes in for the legacy layout and 6 for the current one. A
+            # call's operands follow this order, so it has to be kept.
+            position_offset = 4 if isinstance(_r_aoi, LegacyRxGeneric) else 6
+            children = sorted(
+                ((oid, bytes(rec)) for oid, rec in self._cur.fetchall()),
+                key=lambda child: struct.unpack_from("<H", child[1], position_offset)[0]
+                if len(child[1]) >= position_offset + 2 else 0,
+            )
+            for child_oid, child_rec in children:
                 # Determine whether this is a parameter or a local tag by inspecting
                 # ext01[0x20E]: bits 0x04 (Input) or 0x08 (Output) indicate a parameter.
                 is_param = False
@@ -3452,21 +3646,23 @@ class AoiBuilder(L5xElementBuilder):
                     r_child = RxGeneric.from_bytes(child_rec)
                     exts_child = r_child.attributes
                     ext01 = exts_child.get(0x01, b"")
-                    flags = _aoi_tag_usage_flags(ext01)
+                    flags = _aoi_tag_usage_flags(ext01, isinstance(r_child, LegacyRxGeneric))
                     is_param = bool(flags & 0x0C)
                 except Exception:
                     pass
 
                 if is_param:
                     try:
-                        parameters.append(ParameterBuilder(self._cur, child_oid).build())
+                        parameters.append(ParameterBuilder(self._cur, child_oid, _notes=self._notes, _members=members).build())
                     except Exception:
                         pass
                 else:
                     try:
-                        local_tags.append(LocalTagBuilder(self._cur, child_oid).build())
+                        local_tags.append(LocalTagBuilder(self._cur, child_oid, _members=members).build())
                     except Exception:
                         pass
+
+            self._set_default_data(name, parameters, local_tags)
 
         routines = self._routines()
 
@@ -3474,7 +3670,11 @@ class AoiBuilder(L5xElementBuilder):
         aoi_description: Union[str, None] = None
         revision_note = ""
         if _r_aoi is not None:
-            aoi_comment_parent = (_r_aoi.comment_id * 0x10000) + _r_aoi.cip_type
+            aoi_comment_parent = (
+                _legacy_comment_keys(self._cur, self._object_id)[0]
+                if isinstance(_r_aoi, LegacyRxGeneric)
+                else (_r_aoi.comment_id * 0x10000) + _r_aoi.cip_type
+            )
             self._cur.execute(
                 f"SELECT record_string FROM comments WHERE parent=? AND member_ref=0 AND {_USER_COMMENT} LIMIT 1",
                 (aoi_comment_parent,),
@@ -3949,6 +4149,10 @@ class ControllerBuilder(L5xElementBuilder):
         # rendered becomes a conversion note and is listed in _skipped_tags.
         skipped_tags: List[Dict[str, object]] = []
         for result in results:
+            # Record type 512 is not a tag: it stands for a program tag or data
+            # type of the same name and doesn't appear in a Studio 5000 export.
+            if result[3] == 512:
+                continue
             _tag_object_id = result[1]
             tag_name = result[0]
             try:
@@ -3990,6 +4194,17 @@ class ControllerBuilder(L5xElementBuilder):
         programs = self._programs(
             _program_collection_object_id, data_types_map, value_types_map, redundancy_enabled
         )
+        message_tags = [t.name for t in tags if t.data_type == "MESSAGE"] + [
+            f"{program.name}:{t.name}"
+            for program in programs
+            for t in program.tags or []
+            if t.data_type == "MESSAGE"
+        ]
+        if message_tags:
+            self._notes.warn(
+                "MESSAGE tags were exported without their configuration: "
+                + ", ".join(f"'{name}'" for name in message_tags)
+            )
         comment_id_to_program = self._program_schedule_ids(_program_collection_object_id)
 
         # Get the Task Collection and build Tasks
@@ -4017,7 +4232,9 @@ class ControllerBuilder(L5xElementBuilder):
         aois: List[AOI] = []
         for result in results:
             _aoi_object_id = result[1]
-            aois.append(AoiBuilder(self._cur, _aoi_object_id, _notes=self._notes).build())
+            aois.append(AoiBuilder(
+                self._cur, _aoi_object_id, _notes=self._notes, _value_types_map=value_types_map,
+            ).build())
 
         # Get the Module (IO) Collection and build all Module elements.
         self._cur.execute(
