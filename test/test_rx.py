@@ -495,3 +495,28 @@ def test_legacy_rx_last_attribute_short_header():
         (0x6E, b"\x01" * 12),
         (0x6A, b""),
     ]
+
+
+def _current_rx(attributes: bytes, count: int, stored_length: int) -> bytes:
+    head = struct.pack("<IIHHH", 0, 0, 0, 0x68, 0) + bytes(60)
+    return head + struct.pack("<II", stored_length, count) + attributes
+
+
+def test_rx_reads_final_attribute():
+    attributes = struct.pack("<II", 0x65, 4) + b"\x01\x02\x03\x04" + struct.pack("<II", 0x01, 3) + b"abc"
+    parsed = RxGeneric.from_bytes(_current_rx(attributes, 2, len(attributes) + 8))
+    assert [(item.attribute_id, bytes(item.value)) for item in parsed.extended_records] == [
+        (0x65, b"\x01\x02\x03\x04"),
+        (0x01, b"abc"),
+    ]
+
+
+def test_rx_keeps_readable_attributes_when_final_one_is_cut_short():
+    # Without the four bytes past the stored length the final attribute is
+    # incomplete; the attributes before it are still returned.
+    attributes = struct.pack("<II", 0x65, 4) + b"\x01\x02\x03\x04" + struct.pack("<II", 0x01, 8) + b"abcd"
+    parsed = RxGeneric.from_bytes(_current_rx(attributes, 2, len(attributes) + 8))
+    assert parsed.count_record == 2
+    assert [(item.attribute_id, bytes(item.value)) for item in parsed.extended_records] == [
+        (0x65, b"\x01\x02\x03\x04"),
+    ]

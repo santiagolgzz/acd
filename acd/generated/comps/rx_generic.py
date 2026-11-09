@@ -40,7 +40,7 @@ class RxGeneric(KaitaiStruct):
         self.len_record = self._io.read_u4le()
         self.count_record = self._io.read_u4le()
         self.extended_records = []
-        for i in range(self.count_record - 1):
+        for i in range(self.count_record):
             self.extended_records.append(RxGeneric.AttributeRecord(self._io, self, self._root))
 
 

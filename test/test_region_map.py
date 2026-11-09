@@ -1,3 +1,7 @@
+import sqlite3
+import struct
+from types import SimpleNamespace
+
 import pytest
 
 from acd.l5x.export_l5x import ExportL5x
@@ -57,3 +61,55 @@ def test_modern_region_map_wins_legacy_length_collision():
     assert ExportL5x._parse_region_map(bytes(record)) == [
         (4, 1, 2, 3, bytes(record[0x4E:]))
     ]
+
+
+def _populate(candidates, rung_ids=()):
+    db = sqlite3.connect(":memory:")
+    cur = db.cursor()
+    cur.execute("CREATE TABLE region_map (object_id, parent_id, unknown, seq_no, record)")
+    cur.execute("CREATE TABLE rungs (object_id, rung, seq_number)")
+    cur.executemany("INSERT INTO rungs VALUES (?, '', 0)", [(i,) for i in rung_ids])
+    # The comps table keeps the largest copy.
+    cur.execute("CREATE TABLE comps (object_id, parent_id, comp_name, record)")
+    cur.execute(
+        "INSERT INTO comps VALUES (1, 0, 'Region Map', ?)", (max(candidates, key=len),)
+    )
+    export = SimpleNamespace(
+        _region_map_candidates=candidates,
+        _cur=cur,
+        _db=db,
+        _parse_region_map=ExportL5x._parse_region_map,
+    )
+    ExportL5x.populate_region_map(export)
+    return [row[0] for row in cur.execute("SELECT object_id FROM region_map")]
+
+
+def _modern_region_map(object_ids):
+    record = bytearray(0x4E)
+    for seq, object_id in enumerate(object_ids):
+        record += struct.pack("<IIII", 1, 0, seq, object_id)
+    record[0x4A:0x4E] = (len(record) - 0x4E).to_bytes(4, "little")
+    return bytes(record)
+
+
+def test_stale_region_map_copy_is_skipped():
+    # A larger stale copy that fails validation must not hide the valid one.
+    stale = _modern_region_map([0x10, 0x20]) + b"\x00" * 5
+    assert _populate([_modern_region_map([0x30]), stale]) == [0x30]
+
+
+def test_largest_copy_is_realigned_when_no_copy_validates():
+    # No stored length matches: the largest copy's entries are found by
+    # matching known rungs.
+    entries = b"".join(struct.pack("<IIII", 1, 0, seq, 0x41 + seq) for seq in range(3))
+    largest = bytes(0x50) + entries
+    assert _populate([bytes(0x4E + 3), largest], rung_ids=[0x41, 0x42, 0x43]) == [0x41, 0x42, 0x43]
+
+
+def test_copy_placing_more_known_rungs_wins():
+    # A shorter copy whose stored length checks out must not hide rungs
+    # that the larger copy places once re-aligned.
+    entries = b"".join(struct.pack("<IIII", 1, 0, seq, 0x41 + seq) for seq in range(3))
+    larger = bytes(0x50) + entries
+    shorter = _modern_region_map([0x41])
+    assert _populate([shorter, larger], rung_ids=[0x41, 0x42, 0x43]) == [0x41, 0x42, 0x43]

@@ -66,3 +66,23 @@ def test_legacy_region_map_ignores_unrelated_outer_trailer():
     result = CompsRecord.parse(record)
 
     assert result[5] == b"\x11\x22\x33\x44\x55\x66\x77\x88"
+
+
+def test_current_record_keeps_four_bytes_past_stored_length():
+    # The stored length of a current-layout FAFA record stops four bytes
+    # short of the final attribute; those bytes belong to the payload.
+    record = _comps_record(0xFAFA, False)
+    raw = bytearray(record.record.record_buffer)
+    raw[0:4] = (len(raw) - 4).to_bytes(4, "little")
+    record.record.record_buffer = bytes(raw)
+
+    assert CompsRecord.parse(record)[5] == b"\x11\x22\x33\x44\x55\x66\x77\x88"
+
+
+def test_legacy_record_keeps_tail_when_more_data_follows():
+    record = _comps_record(0xFAFA, True)
+    raw = bytearray(record.record.record_buffer)
+    raw.extend(b"more")
+    record.record.record_buffer = bytes(raw)
+
+    assert CompsRecord.parse(record)[5] == b"\x11\x22\x33\x44\x55\x66\x77\x88"

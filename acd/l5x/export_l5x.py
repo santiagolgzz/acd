@@ -113,9 +113,14 @@ class ExportL5x:
         # or partial record (e.g. record_type=271 vs 259 for routines) that fails to parse
         # correctly with RxGeneric. The full record is always the largest one.
         comps_by_id = {}
+        # Every Region Map record seen; a file can hold stale copies that fail
+        # validation, so populate_region_map tries them all.
+        self._region_map_candidates: List[bytes] = []
         for record in comps_db.records.record:
             t = CompsRecord.parse(record)
             if t is not None:
+                if t[1] == 0 and t[2] == "Region Map":
+                    self._region_map_candidates.append(bytes(t[5]))
                 oid = t[0]
                 if oid not in comps_by_id or len(t[5]) > len(comps_by_id[oid][5]):
                     comps_by_id[oid] = t
@@ -229,10 +234,13 @@ class ExportL5x:
         return self._project
 
     def populate_region_map(self):
-        self._cur.execute(
-            "SELECT comp_name, object_id, parent_id, record FROM comps WHERE parent_id=0 AND comp_name='Region Map'"
-        )
-        results = self._cur.fetchall()
+        # A file can hold several Region Map records, stale copies among
+        # them. Each copy whose stored length checks out is a candidate, and
+        # so is the copy kept in the comps table, re-aligned against known
+        # rungs if its length doesn't check out (see _parse_region_map). The
+        # candidate that places the most known rungs wins; on a tie, a copy
+        # whose length checks out, then the larger one.
+        candidates = sorted(self._region_map_candidates, key=len, reverse=True)
 
         # Entries with a resolved object_id are inserted immediately. A
         # trailing 12-byte (parent_id, unknown, seq) triple with no object_id
@@ -240,15 +248,44 @@ class ExportL5x:
         # which can only run once the `rungs` table exists.
         self._pending_region_map_gaps: List[Tuple[int, int, int]] = []
 
-        if len(results) == 0:
+        self._cur.execute(
+            "SELECT record FROM comps WHERE parent_id=0 AND comp_name='Region Map'"
+        )
+        row = self._cur.fetchone()
+        if row is None and not candidates:
             return
-        record = results[0][3]
+        stored = bytes(row[0]) if row is not None else candidates[0]
 
         self._cur.execute("SELECT object_id FROM rungs")
         known_rung_ids = {row[0] for row in self._cur.fetchall()}
 
+        scored = []
+        stored_checks_out = False
+        for record in candidates:
+            try:
+                entries = self._parse_region_map(record, strict=True)
+            except ValueError:
+                continue
+            scored.append((entries, True, len(record)))
+            stored_checks_out = stored_checks_out or record == stored
+        if not stored_checks_out:
+            try:
+                entries = self._parse_region_map(stored, known_rung_ids)
+            except ValueError:
+                if not scored:
+                    raise
+            else:
+                scored.append((entries, False, len(stored)))
+
+        def rank(candidate):
+            entries, valid, size = candidate
+            placed = {e[0] for e in entries if e[0] in known_rung_ids}
+            return len(placed), valid, size
+
+        parsed = max(scored, key=rank)[0]
+
         complete_entries = []
-        for object_id, parent_id, unknown, seq, raw in self._parse_region_map(record, known_rung_ids):
+        for object_id, parent_id, unknown, seq, raw in parsed:
             if object_id is None:
                 self._pending_region_map_gaps.append((parent_id, unknown, seq))
             else:
@@ -393,7 +430,9 @@ class ExportL5x:
         return None
 
     @staticmethod
-    def _parse_region_map(record, known_rung_ids=None):
+    def _parse_region_map(record, known_rung_ids=None, strict=False):
+        # strict: raise on a stored length that doesn't match the record
+        # instead of re-aligning (used to pick between Region Map copies).
         # Current empty projects use a header-only Region Map without a length
         # field or entries.
         if len(record) == 0x4A:
@@ -404,11 +443,15 @@ class ExportL5x:
         # preceding the entries in their stored length.
         if (
             len(record) >= 78
+            # CompsRecord.parse keeps the four bytes past the stored length.
             and struct.unpack_from("<I", record, 0x4A)[0]
-            == len(record) - 0x4A
+            in (len(record) - 0x4A, len(record) - 0x4E)
         ):
             identifier_offset = 0x4E
-            entries_length = struct.unpack_from("<I", record, 0x4A)[0] - 4
+            # Everything after the 78-byte prefix is entries: the stored
+            # length leaves out the final four bytes that CompsRecord.parse
+            # keeps, which hold the last entry's object id.
+            entries_length = len(record) - 0x4E
             # Current records can carry a 12-byte non-entry trailer.
             allowed_trailer_lengths = (0, 12)
         else:
@@ -421,7 +464,7 @@ class ExportL5x:
                 identifier_offset = 0x1C
                 entries_length = len(record) - identifier_offset
                 allowed_trailer_lengths = (0,)
-            elif len(record) >= 78:
+            elif len(record) >= 78 and not strict:
                 # Neither the modern nor the legacy self-described length
                 # field matches the record's actual on-disk size -- observed
                 # on real project files where the stored 0x4A length is

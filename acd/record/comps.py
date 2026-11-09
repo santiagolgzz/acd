@@ -76,9 +76,9 @@ class CompsRecord:
                 # Legacy FAFA lengths stop four bytes before the physical
                 # record. Those bytes contain the end of the final Rx
                 # attribute, so retain them when that exact trailer exists.
-                if record_name == "Region Map" and payload_end + 4 <= len(raw):
-                    payload_end += 4
-                elif payload_end + 4 == len(raw):
+                # The physical record can also be longer than that (other
+                # data follows), so keep the four bytes whenever they exist.
+                if payload_end + 4 <= len(raw):
                     payload_end += 4
             else:
                 payload_start = 0x97
@@ -98,6 +98,19 @@ class CompsRecord:
 
         if dat_record.identifier == 64250:
             r = FafaComps.from_bytes(raw)
+            # The declared length stops four bytes short of the record's last
+            # Rx attribute (the same quirk as the legacy layout above); keep
+            # those bytes so the final attribute is complete.
+            end = 148 + len(r.record_buffer) + 4
+            buffer = raw[148:end] if end <= len(raw) else r.record_buffer
+            return (
+                r.header.object_id,
+                r.header.parent_id,
+                r.header.record_name.value,
+                r.header.seq_number,
+                r.header.record_type,
+                buffer,
+            )
         elif dat_record.identifier == 65021:
             r = FdfdComps(
                 dat_record.len_record,
